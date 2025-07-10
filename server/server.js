@@ -9,48 +9,85 @@ dotenv.config();
 const app = express();
 
 // Enhanced CORS configuration
+const allowedOrigins = [
+  'http://localhost:5173', // Local development
+  'https://grpharmacyappfrontend.vercel.app', // Your Vercel frontend
+  // Add any other domains that need access
+];
+
 const corsOptions = {
-  origin: 'http://localhost:5173',
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Role'],
-  credentials: true
+  credentials: true,
+  optionsSuccessStatus: 200 // For legacy browser support
 };
 
-app.use(cors(corsOptions)); // Apply CORS with options
+app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Enable preflight for all routes
 
+// Add middleware to parse JSON bodies
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
+// MongoDB connection
 const uri = process.env.MONGO_URI;
 
-mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
+mongoose.connect(uri)
   .then(() => console.log("✅ MongoDB connected"))
   .catch(err => console.error("❌ MongoDB connection error:", err));
 
 // Define schema + model
 const orderSchema = new mongoose.Schema({
-  product: { type: String, enum: ['pharmacyjpmc', 'pharmacymoh'], index: true},
+  product: { type: String, enum: ['pharmacyjpmc', 'pharmacymoh'], index: true },
+  receiverName: String,
+  patientNumber: String,
+  receiverPhoneNumber: String,
+  receiverAddress: String,
+  medicationName: String,
+  doTrackingNumber: String,
+  paymentMethod: String,
+  paymentAmount: Number,
+  jobMethod: String,
+  collectionDate: Date,
+  collectionStatus: String,
+  creationDate: { type: Date, default: Date.now },
+  dateTimeSubmission: Date,
+  updatedAt: { type: Date, default: Date.now },
   logs: [
-  {
-    note: { type: String, required: true },
-    category: { type: String, required: true },
-    createdBy: { type: String, required: true },
-    createdAt: { type: Date, default: Date.now },
-  },
-],
-pharmacyRemarks: [
-  {
-    remark: { type: String, required: true },
-    createdBy: { type: String, required: true },
-    createdAt: { type: Date, default: Date.now },
-  }
-],
-// Added dual status fields
-goRushStatus: { type: String, default: 'pending' }, // Status for Go Rush team
-pharmacyStatus: { type: String, default: 'pending' } // Status for Pharmacy team
-}, { collection: 'orders', strict: false });
+    {
+      note: { type: String, required: true },
+      category: { type: String, required: true },
+      createdBy: { type: String, required: true },
+      createdAt: { type: Date, default: Date.now },
+    },
+  ],
+  pharmacyRemarks: [
+    {
+      remark: { type: String, required: true },
+      createdBy: { type: String, required: true },
+      createdAt: { type: Date, default: Date.now },
+    }
+  ],
+  // Added dual status fields
+  goRushStatus: { type: String, default: 'pending' }, // Status for Go Rush team
+  pharmacyStatus: { type: String, default: 'pending' } // Status for Pharmacy team
+}, { collection: 'orders', strict: false, timestamps: true });
+
 const Order = mongoose.model('Order', orderSchema);
 
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date() });
+});
+
+// Helper functions
 const getDateFilter = () => {
   return {
     creationDate: {
@@ -111,7 +148,6 @@ function canAccessOrder(userRole, order) {
   return false;
 }
 
-// New function for determining update permissions
 function canUpdateOrder(userRole, order, updateType) {
   const role = (userRole || '').toLowerCase().trim();
   
@@ -134,17 +170,12 @@ function canUpdateOrder(userRole, order, updateType) {
   return false;
 }
 
-// Updated to use date filter instead of limits
 function getQueryOptions(userRole) {
-  const role = (userRole || '').toLowerCase().trim();
-  
-  // All roles now use the same date-based filter
   return {
     sort: { creationDate: -1 }
   };
 }
 
-// Helper function to combine all filters
 function getCombinedFilter(userRole) {
   const productFilter = getProductFilter(userRole);
   const dateFilter = getDateFilter();
@@ -164,27 +195,25 @@ function extractUserRole(req, res, next) {
 // Apply user role middleware to all routes
 app.use('/api', extractUserRole);
 
+// Logging middleware
 app.use('/api/orders', (req, res, next) => {
   console.log(`[${new Date().toISOString()}] Role: ${req.userRole}, Path: ${req.path}`);
   next();
 });
 
+// Routes
 app.use('/api/auth', authRoutes);
 
+// Order routes
 app.get('/api/orders', async (req, res) => {
   try {
     const combinedFilter = getCombinedFilter(req.userRole);
     const queryOptions = getQueryOptions(req.userRole);
 
-    console.log(`🏷️ User role: ${req.userRole}`);
-    console.log(`🔍 Combined filter:`, combinedFilter);
-
-    let query = Order.find(combinedFilter)
+    const orders = await Order.find(combinedFilter)
       .sort(queryOptions.sort || {});
 
-    const orders = await query;
     res.json(orders);
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
