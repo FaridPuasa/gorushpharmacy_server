@@ -2,6 +2,7 @@ import express from 'express';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import compression from 'compression';
 import authRoutes from './routes/auth.js';
 
 dotenv.config();
@@ -21,6 +22,8 @@ const corsOptions = {
 
 app.use(cors(corsOptions)); // Apply CORS with options
 app.options('*', cors(corsOptions)); // Enable preflight for all routes
+
+app.use(compression());
 
 app.use(express.json());
 
