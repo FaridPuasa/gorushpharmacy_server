@@ -3,9 +3,12 @@ import mongoose from 'mongoose';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import compression from 'compression';
+import NodeCache from 'node-cache';
 import authRoutes from './routes/auth.js';
 
 dotenv.config();
+
+const cache = new NodeCache({ stdTTL: 300 });
 
 const app = express();
 
@@ -21,7 +24,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions)); // Apply CORS with options
-app.options('*', cors(corsOptions)); // Enable preflight for all routes
+app.options('*', cors(corsOptions)); // Enable preflight for all routesa
 
 app.use(compression());
 
@@ -183,18 +186,22 @@ app.use('/api/auth', authRoutes);
 
 app.get('/api/orders', async (req, res) => {
   try {
-    const combinedFilter = getCombinedFilter(req.userRole);
-    const queryOptions = getQueryOptions(req.userRole);
+    const role = req.userRole || 'jpmc';
+    const cacheKey = `orders-${role}`;
 
-    console.log(`🏷️ User role: ${req.userRole}`);
-    console.log(`🔍 Combined filter:`, combinedFilter);
+    // Check if cached
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) {
+      return res.json(cachedData);
+    }
 
-    let query = Order.find(combinedFilter)
-      .sort(queryOptions.sort || {});
+    const combinedFilter = getCombinedFilter(role);
+    const queryOptions = getQueryOptions(role);
 
-    const orders = await query;
+    const orders = await Order.find(combinedFilter).sort(queryOptions.sort || {});
+
+    cache.set(cacheKey, orders); // Cache the result
     res.json(orders);
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -202,8 +209,14 @@ app.get('/api/orders', async (req, res) => {
 
 app.get('/api/customers', async (req, res) => {
   try {
-    const combinedFilter = getCombinedFilter(req.userRole);
-    
+    const role = req.userRole || 'jpmc';
+    const cacheKey = `customers-${role}`;
+
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    const combinedFilter = getCombinedFilter(role);
+
     let aggregationPipeline = [
       { $match: combinedFilter },
       { $sort: { creationDate: -1 } },
@@ -230,14 +243,15 @@ app.get('/api/customers', async (req, res) => {
       },
       { $sort: { receiverName: 1 } }
     ];
-    
+
     const customers = await Order.aggregate(aggregationPipeline);
-    
+    cache.set(cacheKey, customers);
     res.json(customers);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 app.get('/api/customers/:patientNumber/orders', async (req, res) => {
   try {
