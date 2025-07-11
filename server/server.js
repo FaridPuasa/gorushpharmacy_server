@@ -8,28 +8,9 @@ import authRoutes from './routes/auth.js';
 
 dotenv.config();
 
-// Enhanced cache configuration
-const cache = new NodeCache({ 
-  stdTTL: process.env.CACHE_TTL || 300, // 5 minutes default
-  checkperiod: 60, // Check for expired keys every minute
-  useClones: false // Don't clone data for better performance
-});
+const cache = new NodeCache({ stdTTL: 300 });
 
 const app = express();
-
-// Performance monitoring middleware
-app.use((req, res, next) => {
-  const start = Date.now();
-  
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    if (duration > 1000) { // Log slow requests
-      console.log(`🐌 Slow request: ${req.method} ${req.path} - ${duration}ms`);
-    }
-  });
-  
-  next();
-});
 
 // Enhanced CORS configuration
 const corsOptions = {
@@ -42,84 +23,42 @@ const corsOptions = {
   credentials: true
 };
 
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-
-// Keep-alive headers for better connection reuse
-app.use((req, res, next) => {
-  res.setHeader('Connection', 'keep-alive');
-  next();
-});
+app.use(cors(corsOptions)); // Apply CORS with options
+app.options('*', cors(corsOptions)); // Enable preflight for all routesa
 
 app.use(compression());
-app.use(express.json({ limit: '10mb' }));
+
+app.use(express.json());
 
 const uri = process.env.MONGO_URI;
 
-// Optimized MongoDB connection
-const mongoOptions = {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-  maxPoolSize: 10, // Maintain up to 10 socket connections
-  serverSelectionTimeoutMS: 5000, // Keep trying to send operations for 5 seconds
-  socketTimeoutMS: 45000, // Close sockets after 45 seconds of inactivity
-  family: 4, // Use IPv4, skip trying IPv6
-  bufferCommands: false, // Disable mongoose buffering
-  bufferMaxEntries: 0 // Disable mongoose buffering
-};
-
-mongoose.connect(uri, mongoOptions)
-  .then(() => console.log("✅ MongoDB connected with optimized settings"))
+mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log("✅ MongoDB connected"))
   .catch(err => console.error("❌ MongoDB connection error:", err));
 
-// Optimized schema with proper indexing
+// Define schema + model
 const orderSchema = new mongoose.Schema({
   product: { type: String, enum: ['pharmacyjpmc', 'pharmacymoh'], index: true},
-  creationDate: { type: Date, index: true }, // For date filtering
-  patientNumber: { type: String, index: true }, // For customer queries
-  receiverName: { type: String, index: true }, // For customer grouping
-  collectionDate: { type: Date, index: true }, // For collection date queries
-  goRushStatus: { type: String, default: 'pending', index: true },
-  pharmacyStatus: { type: String, default: 'pending', index: true },
   logs: [
-    {
-      note: { type: String, required: true },
-      category: { type: String, required: true },
-      createdBy: { type: String, required: true },
-      createdAt: { type: Date, default: Date.now },
-    },
-  ],
-  pharmacyRemarks: [
-    {
-      remark: { type: String, required: true },
-      createdBy: { type: String, required: true },
-      createdAt: { type: Date, default: Date.now },
-    }
-  ],
+  {
+    note: { type: String, required: true },
+    category: { type: String, required: true },
+    createdBy: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now },
+  },
+],
+pharmacyRemarks: [
+  {
+    remark: { type: String, required: true },
+    createdBy: { type: String, required: true },
+    createdAt: { type: Date, default: Date.now },
+  }
+],
+// Added dual status fields
+goRushStatus: { type: String, default: 'pending' }, // Status for Go Rush team
+pharmacyStatus: { type: String, default: 'pending' } // Status for Pharmacy team
 }, { collection: 'orders', strict: false });
-
-// Create compound indexes for complex queries
-orderSchema.index({ product: 1, creationDate: -1 }); // For filtered queries
-orderSchema.index({ receiverName: 1, patientNumber: 1 }); // For customer grouping
-orderSchema.index({ collectionDate: 1, product: 1 }); // For collection date queries
-
 const Order = mongoose.model('Order', orderSchema);
-
-// Cache helper functions
-function invalidateCache(pattern) {
-  const keys = cache.keys();
-  keys.forEach(key => {
-    if (key.includes(pattern)) {
-      cache.del(key);
-    }
-  });
-}
-
-function getCacheKey(req, prefix) {
-  const role = req.userRole || 'jpmc';
-  const query = JSON.stringify(req.query);
-  return `${prefix}-${role}-${query}`;
-}
 
 const getDateFilter = () => {
   return {
@@ -181,6 +120,7 @@ function canAccessOrder(userRole, order) {
   return false;
 }
 
+// New function for determining update permissions
 function canUpdateOrder(userRole, order, updateType) {
   const role = (userRole || '').toLowerCase().trim();
   
@@ -203,14 +143,17 @@ function canUpdateOrder(userRole, order, updateType) {
   return false;
 }
 
+// Updated to use date filter instead of limits
 function getQueryOptions(userRole) {
   const role = (userRole || '').toLowerCase().trim();
   
+  // All roles now use the same date-based filter
   return {
     sort: { creationDate: -1 }
   };
 }
 
+// Helper function to combine all filters
 function getCombinedFilter(userRole) {
   const productFilter = getProductFilter(userRole);
   const dateFilter = getDateFilter();
@@ -223,24 +166,15 @@ function getCombinedFilter(userRole) {
 
 // Middleware to extract user role from headers
 function extractUserRole(req, res, next) {
-  req.userRole = req.headers['x-user-role'] || req.query.role || 'jpmc';
+  req.userRole = req.headers['x-user-role'] || req.query.role || 'jpmc'; // Default to jpmc
   next();
 }
-
-// Health check endpoint for keeping service warm
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
-});
 
 app.get('/', (req, res) => {
   res.send('GR Pharmacy Backend is running ✅');
 });
 
-// Apply user role middleware to all API routes
+// Apply user role middleware to all routes
 app.use('/api', extractUserRole);
 
 app.use('/api/orders', (req, res, next) => {
@@ -250,13 +184,12 @@ app.use('/api/orders', (req, res, next) => {
 
 app.use('/api/auth', authRoutes);
 
-// Optimized orders endpoint
 app.get('/api/orders', async (req, res) => {
   try {
     const role = req.userRole || 'jpmc';
-    const cacheKey = getCacheKey(req, 'orders');
+    const cacheKey = `orders-${role}`;
 
-    // Check cache first
+    // Check if cached
     const cachedData = cache.get(cacheKey);
     if (cachedData) {
       return res.json(cachedData);
@@ -265,34 +198,25 @@ app.get('/api/orders', async (req, res) => {
     const combinedFilter = getCombinedFilter(role);
     const queryOptions = getQueryOptions(role);
 
-    // Use lean() for better performance - returns plain JS objects
-    const orders = await Order.find(combinedFilter)
-      .sort(queryOptions.sort || {})
-      .lean() // This is crucial for performance
-      .limit(1000) // Add reasonable limit
-      .exec();
+    const orders = await Order.find(combinedFilter).sort(queryOptions.sort || {});
 
-    // Cache with shorter TTL for frequently changing data
-    cache.set(cacheKey, orders, 180); // 3 minutes for orders
+    cache.set(cacheKey, orders); // Cache the result
     res.json(orders);
   } catch (error) {
-    console.error('Error fetching orders:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Optimized customers endpoint
 app.get('/api/customers', async (req, res) => {
   try {
     const role = req.userRole || 'jpmc';
-    const cacheKey = getCacheKey(req, 'customers');
+    const cacheKey = `customers-${role}`;
 
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
 
     const combinedFilter = getCombinedFilter(role);
 
-    // Optimize aggregation pipeline
     let aggregationPipeline = [
       { $match: combinedFilter },
       { $sort: { creationDate: -1 } },
@@ -317,50 +241,36 @@ app.get('/api/customers', async (req, res) => {
           firstOrderDate: 1
         }
       },
-      { $sort: { receiverName: 1 } },
-      { $limit: 500 } // Add reasonable limit
+      { $sort: { receiverName: 1 } }
     ];
 
-    const customers = await Order.aggregate(aggregationPipeline).exec();
-    
-    // Cache customers for longer since they change less frequently
-    cache.set(cacheKey, customers, 600); // 10 minutes
+    const customers = await Order.aggregate(aggregationPipeline);
+    cache.set(cacheKey, customers);
     res.json(customers);
   } catch (error) {
-    console.error('Error fetching customers:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Optimized customer orders endpoint
+
 app.get('/api/customers/:patientNumber/orders', async (req, res) => {
   try {
     const { patientNumber } = req.params;
-    const cacheKey = getCacheKey(req, `customer-orders-${patientNumber}`);
-    
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
-
     const combinedFilter = getCombinedFilter(req.userRole);
     
-    const orders = await Order.find({ 
+    let query = Order.find({ 
       ...combinedFilter,
       patientNumber: patientNumber 
-    })
-    .sort({ creationDate: -1 })
-    .lean()
-    .limit(100)
-    .exec();
+    }).sort({ creationDate: -1 });
     
-    cache.set(cacheKey, orders, 300); // 5 minutes
+    const orders = await query;
+    
     res.json(orders);
   } catch (error) {
-    console.error('Error fetching customer orders:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Optimized collection date update with cache invalidation
 app.put('/api/orders/:id/collection-date', async (req, res) => {
   try {
     const { id } = req.params;
@@ -371,7 +281,7 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
     }
 
     // First find the order without product filter
-    const order = await Order.findById(id).lean();
+    const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
@@ -385,12 +295,17 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
       updatedAt: new Date()
     };
 
+    // Explicitly check if collectionDate is null or empty string
     if (collectionDate === null || collectionDate === '') {
       updateData.collectionDate = null;
       updateData.collectionStatus = collectionStatus || 'pending';
-    } else if (collectionDate) {
+    } 
+    // If collectionDate has a value, use it
+    else if (collectionDate) {
       updateData.collectionDate = new Date(collectionDate);
-    } else {
+    }
+    // If collectionDate is undefined, don't modify it
+    else {
       return res.status(400).json({ 
         error: 'Missing collectionDate in request body' 
       });
@@ -399,13 +314,8 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
     const updatedOrder = await Order.findByIdAndUpdate(
       id,
       updateData,
-      { new: true, lean: true }
+      { new: true }
     );
-
-    // Invalidate related caches
-    invalidateCache('orders');
-    invalidateCache('customers');
-    invalidateCache('collection-dates');
 
     res.json(updatedOrder);
   } catch (error) {
@@ -417,14 +327,8 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
   }
 });
 
-// Optimized collection dates endpoint
 app.get('/api/collection-dates', async (req, res) => {
   try {
-    const cacheKey = getCacheKey(req, 'collection-dates');
-    
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
-
     const combinedFilter = getCombinedFilter(req.userRole);
     
     const matchCondition = {
@@ -449,13 +353,11 @@ app.get('/api/collection-dates', async (req, res) => {
           _id: 0
         }
       },
-      { $sort: { date: 1 } },
-      { $limit: 100 } // Reasonable limit
+      { $sort: { date: 1 } }
     ];
     
-    const dates = await Order.aggregate(aggregationPipeline).exec();
+    const dates = await Order.aggregate(aggregationPipeline);
     
-    cache.set(cacheKey, dates, 600); // 10 minutes
     res.json(dates);
   } catch (error) {
     console.error('Error fetching collection dates:', error);
@@ -463,7 +365,7 @@ app.get('/api/collection-dates', async (req, res) => {
   }
 });
 
-// Optimized orders by collection date
+// Get orders for a specific collection date
 app.get('/api/orders/collection-dates', async (req, res) => {
   try {
     const { date } = req.query;
@@ -472,30 +374,22 @@ app.get('/api/orders/collection-dates', async (req, res) => {
       return res.status(400).json({ error: 'Date parameter is required' });
     }
 
-    const cacheKey = getCacheKey(req, `orders-by-date-${date}`);
-    
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
-
     const startDate = new Date(date);
     const endDate = new Date(date);
     endDate.setDate(endDate.getDate() + 1);
     
     const combinedFilter = getCombinedFilter(req.userRole);
     
-    const orders = await Order.find({
+    let query = Order.find({
       collectionDate: {
         $gte: startDate,
         $lt: endDate
       },
       ...combinedFilter
-    })
-    .sort({ collectionDate: 1 })
-    .lean()
-    .limit(500)
-    .exec();
+    }).sort({ collectionDate: 1 });
 
-    cache.set(cacheKey, orders, 300); // 5 minutes
+    const orders = await query;
+
     res.json(orders);
   } catch (error) {
     console.error('Error fetching orders for date:', error);
@@ -503,7 +397,7 @@ app.get('/api/orders/collection-dates', async (req, res) => {
   }
 });
 
-// Optimized single order endpoint
+// UPDATED: Get a specific order with proper access control
 app.get('/api/orders/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -512,28 +406,18 @@ app.get('/api/orders/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid order ID' });
     }
 
-    // Check cache first
-    const cacheKey = `order-${id}`;
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      if (canAccessOrder(req.userRole, cached)) {
-        return res.json(cached);
-      } else {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-    }
-
-    const order = await Order.findById(id).lean();
+    // First find the order without product filter
+    const order = await Order.findById(id);
     
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // Check if user can access this order
     if (!canAccessOrder(req.userRole, order)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    cache.set(cacheKey, order, 300); // 5 minutes
     res.json(order);
   } catch (error) {
     console.error('Error fetching order:', error);
@@ -541,7 +425,6 @@ app.get('/api/orders/:id', async (req, res) => {
   }
 });
 
-// Optimized DeTrack endpoint
 app.get('/api/detrack/:trackingNumber', async (req, res) => {
   try {
     const { trackingNumber } = req.params;
@@ -549,11 +432,6 @@ app.get('/api/detrack/:trackingNumber', async (req, res) => {
     if (!trackingNumber) {
       return res.status(400).json({ error: 'Tracking number is required' });
     }
-
-    // Check cache first
-    const cacheKey = `detrack-${trackingNumber}`;
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
 
     const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${trackingNumber}`, {
       method: 'GET',
@@ -570,9 +448,6 @@ app.get('/api/detrack/:trackingNumber', async (req, res) => {
     }
     
     const data = await response.json();
-    
-    // Cache DeTrack data for 5 minutes
-    cache.set(cacheKey, data, 300);
     res.json(data);
     
   } catch (error) {
@@ -584,7 +459,7 @@ app.get('/api/detrack/:trackingNumber', async (req, res) => {
   }
 });
 
-// Optimized Go Rush status update
+// UPDATED: Go Rush Status with proper permission checking
 app.put('/api/orders/:id/go-rush-status', async (req, res) => {
   try {
     const { id } = req.params;
@@ -598,11 +473,13 @@ app.put('/api/orders/:id/go-rush-status', async (req, res) => {
       return res.status(400).json({ error: 'Status is required' });
     }
 
-    const order = await Order.findById(id).lean();
+    // First find the order
+    const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // Check if user can update this order
     if (!canUpdateOrder(req.userRole, order, 'goRushStatus')) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -613,12 +490,8 @@ app.put('/api/orders/:id/go-rush-status', async (req, res) => {
         goRushStatus: status,
         updatedAt: new Date()
       },
-      { new: true, lean: true, runValidators: false }
+      { new: true, runValidators: false }
     );
-
-    // Invalidate caches
-    invalidateCache('orders');
-    cache.del(`order-${id}`);
 
     res.json(updatedOrder);
 
@@ -628,7 +501,7 @@ app.put('/api/orders/:id/go-rush-status', async (req, res) => {
   }
 });
 
-// Optimized Pharmacy status update
+// UPDATED: Pharmacy Status with proper permission checking
 app.put('/api/orders/:id/pharmacy-status', async (req, res) => {
   try {
     const { id } = req.params;
@@ -642,11 +515,13 @@ app.put('/api/orders/:id/pharmacy-status', async (req, res) => {
       return res.status(400).json({ error: 'Status is required' });
     }
 
-    const order = await Order.findById(id).lean();
+    // First find the order
+    const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // Check if user can update this order
     if (!canUpdateOrder(req.userRole, order, 'pharmacyStatus')) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -657,12 +532,8 @@ app.put('/api/orders/:id/pharmacy-status', async (req, res) => {
         pharmacyStatus: status,
         updatedAt: new Date()
       },
-      { new: true, lean: true, runValidators: false }
+      { new: true, runValidators: false }
     );
-
-    // Invalidate caches
-    invalidateCache('orders');
-    cache.del(`order-${id}`);
 
     res.json(updatedOrder);
 
@@ -672,7 +543,7 @@ app.put('/api/orders/:id/pharmacy-status', async (req, res) => {
   }
 });
 
-// Legacy status endpoint (backward compatibility)
+// Legacy endpoint for backward compatibility (now updates goRushStatus)
 app.put('/api/orders/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
@@ -686,11 +557,13 @@ app.put('/api/orders/:id/status', async (req, res) => {
       return res.status(400).json({ error: 'Status is required' });
     }
 
-    const order = await Order.findById(id).lean();
+    // First find the order
+    const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // Check if user can update this order
     if (!canUpdateOrder(req.userRole, order, 'goRushStatus')) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -698,15 +571,11 @@ app.put('/api/orders/:id/status', async (req, res) => {
     const updatedOrder = await Order.findByIdAndUpdate(
       id,
       { 
-        goRushStatus: status,
+        goRushStatus: status, // Default to Go Rush status for backward compatibility
         updatedAt: new Date()
       },
-      { new: true, lean: true, runValidators: false }
+      { new: true, runValidators: false }
     );
-
-    // Invalidate caches
-    invalidateCache('orders');
-    cache.del(`order-${id}`);
 
     res.json(updatedOrder);
 
@@ -716,7 +585,7 @@ app.put('/api/orders/:id/status', async (req, res) => {
   }
 });
 
-// Optimized logs endpoint
+// UPDATED: Logs with proper permission checking
 app.post('/api/orders/:id/logs', async (req, res) => {
   const { id } = req.params;
   const { note, category, createdBy } = req.body;
@@ -726,11 +595,13 @@ app.post('/api/orders/:id/logs', async (req, res) => {
   }
 
   try {
+    // First find the order
     const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // Check if user can update this order
     if (!canUpdateOrder(req.userRole, order, 'logs')) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -745,18 +616,14 @@ app.post('/api/orders/:id/logs', async (req, res) => {
     order.logs.push(logEntry);
     await order.save();
 
-    // Invalidate caches
-    invalidateCache('orders');
-    cache.del(`order-${id}`);
-
     res.status(201).json({ message: 'Log added successfully', log: logEntry });
   } catch (err) {
-    console.error('Error adding log:', err);
+    console.error(err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Optimized pharmacy remarks endpoint
+// UPDATED: Pharmacy remarks with proper permission checking
 app.post('/api/orders/:id/pharmacy-remarks', async (req, res) => {
   const { id } = req.params;
   const { remark, createdBy } = req.body;
@@ -766,11 +633,13 @@ app.post('/api/orders/:id/pharmacy-remarks', async (req, res) => {
   }
 
   try {
+    // First find the order
     const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // Check if user can update this order
     if (!canUpdateOrder(req.userRole, order, 'pharmacyRemarks')) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -784,34 +653,14 @@ app.post('/api/orders/:id/pharmacy-remarks', async (req, res) => {
     order.pharmacyRemarks.push(entry);
     await order.save();
 
-    // Invalidate caches
-    invalidateCache('orders');
-    cache.del(`order-${id}`);
-
     res.status(201).json({ message: 'Remark added', remark: entry });
   } catch (err) {
-    console.error('Error adding remark:', err);
+    console.error(err);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
-  });
-});
-
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Route not found' });
 });
 
 const port = process.env.PORT || 5050;
 app.listen(port, () => {
   console.log(`🚀 Server running on http://localhost:${port}`);
-  console.log(`💾 Cache TTL: ${process.env.CACHE_TTL || 300} seconds`);
-  console.log(`🔍 MongoDB Pool Size: ${mongoOptions.maxPoolSize}`);
 });
