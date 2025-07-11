@@ -25,6 +25,13 @@ const seedUsers = async () => {
         subrole: 'customer_service'
       },
       {
+        username: 'customer.care@globex.com.bn',
+        email: 'customer.care@globex.com.bn',
+        password: 'Gsb2332065!',
+        role: 'gorush',
+        subrole: 'customer_service'
+      },
+      {
         username: 'jpmcuser',
         email: 'jpmcuser@jpmc.com',
         password: 'jpmc123',
