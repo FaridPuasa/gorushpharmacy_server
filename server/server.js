@@ -60,7 +60,7 @@ const Order = mongoose.model('Order', orderSchema);
 const getDateFilter = () => {
   return {
     creationDate: {
-      $gte: '2025-07-07'
+      $gte: '2025-07-11'
     }
   };
 };
