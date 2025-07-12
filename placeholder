@@ -35,7 +35,7 @@ mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
 
 // Define schema + model
 const orderSchema = new mongoose.Schema({
-  product: { type: String, enum: ['pharmacyjpmc'], index: true},
+  product: { type: String, enum: ['pharmacyjpmc', 'pharmacymoh'], index: true},
   logs: [
   {
     note: { type: String, required: true },
@@ -93,7 +93,7 @@ function getProductFilter(userRole) {
 
   if (role === 'gorush') {
     return {
-      product: { $in: ['pharmacyjpmc'] }
+      product: { $in: ['pharmacymoh', 'pharmacyjpmc'] }
     };
   }
 
