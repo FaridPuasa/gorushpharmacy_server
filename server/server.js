@@ -257,6 +257,45 @@ app.get('/api/customers/:patientNumber/orders', async (req, res) => {
   }
 });
 
+app.put('/api/orders/bulk-go-rush-status', async (req, res) => {
+  try {
+    const { orderIds, status } = req.body;
+    const userRole = req.headers['x-user-role'];
+
+    // Validate input
+    if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) {
+      return res.status(400).json({ error: 'Invalid order IDs' });
+    }
+
+    if (!status || !['pending', 'in progress', 'ready', 'collected', 'completed', 'cancelled'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    // Check user role
+    if (userRole !== 'gorush') {
+      return res.status(403).json({ error: 'Only Go Rush users can perform bulk updates' });
+    }
+
+    // Update all orders
+    const result = await Order.updateMany(
+      { _id: { $in: orderIds } },
+      { 
+        goRushStatus: status,
+        updatedAt: new Date()
+      }
+    );
+
+    res.json({
+      message: 'Bulk update successful',
+      modifiedCount: result.modifiedCount
+    });
+
+  } catch (error) {
+    console.error('Error during bulk update:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.put('/api/orders/:id/collection-date', async (req, res) => {
   try {
     const { id } = req.params;
