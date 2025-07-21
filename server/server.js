@@ -4,6 +4,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import compression from 'compression';
 import authRoutes from './routes/auth.js';
+import cron from 'node-cron';
 
 dotenv.config();
 
@@ -296,6 +297,7 @@ app.put('/api/orders/bulk-go-rush-status', async (req, res) => {
   }
 });
 
+
 app.put('/api/orders/:id/collection-date', async (req, res) => {
   try {
     const { id } = req.params;
@@ -450,6 +452,8 @@ app.get('/api/orders/:id', async (req, res) => {
   }
 });
 
+
+// Updated DeTrack endpoint with comprehensive debugging and auto status update
 app.get('/api/detrack/:trackingNumber', async (req, res) => {
   try {
     const { trackingNumber } = req.params;
@@ -457,6 +461,8 @@ app.get('/api/detrack/:trackingNumber', async (req, res) => {
     if (!trackingNumber) {
       return res.status(400).json({ error: 'Tracking number is required' });
     }
+
+    console.log(`🔍 Fetching DeTrack data for tracking number: ${trackingNumber}`);
 
     const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${trackingNumber}`, {
       method: 'GET',
@@ -473,14 +479,392 @@ app.get('/api/detrack/:trackingNumber', async (req, res) => {
     }
     
     const data = await response.json();
+    console.log(`📦 DeTrack response for ${trackingNumber}:`, JSON.stringify(data, null, 2));
+    
+    // Check if status is "at_warehouse" and update Go Rush status
+    console.log(`🔍 Checking status: ${data.status} (type: ${typeof data.status})`);
+    console.log(`🔍 Checking tracking_status: ${data.tracking_status} (type: ${typeof data.tracking_status})`);
+    
+    if (data && data.status && data.status === 'at_warehouse') {
+      console.log(`✅ Status is 'at_warehouse', proceeding with order update`);
+      
+      try {
+        // Find order by tracking number
+        console.log(`🔍 Searching for order with doTrackingNumber: ${trackingNumber}`);
+        
+        const order = await Order.findOne({
+          doTrackingNumber: trackingNumber
+        });
+        
+        console.log(`🔍 Order search result:`, order ? `Found order ID: ${order._id}` : 'No order found');
+        
+        if (order) {
+          console.log(`📝 Current order status - goRushStatus: ${order.goRushStatus}, pharmacyStatus: ${order.pharmacyStatus}`);
+          
+          // Check if already collected to avoid unnecessary updates
+          if (order.goRushStatus === 'collected') {
+            console.log(`ℹ️ Order already marked as collected, skipping update`);
+            data.orderUpdated = false;
+            data.message = 'Order already marked as collected';
+          } else {
+            // Update Go Rush status to "collected"
+            const updatedOrder = await Order.findByIdAndUpdate(
+              order._id,
+              { 
+                goRushStatus: 'collected',
+                updatedAt: new Date()
+              },
+              { new: true, runValidators: false }
+            );
+            
+            console.log(`✅ Updated Go Rush status to 'collected' for order: ${order._id}`);
+            
+            // Add a log entry for this automatic update
+            const logEntry = {
+              note: `Status automatically updated to 'collected' based on DeTrack status: ${data.tracking_status || data.status}`,
+              category: 'system',
+              createdBy: 'system',
+              createdAt: new Date(),
+            };
+            
+            updatedOrder.logs.push(logEntry);
+            await updatedOrder.save();
+            
+            console.log(`📝 Added system log entry for automatic status update`);
+            
+            // Include the updated order info in the response
+            data.orderUpdated = true;
+            data.updatedGoRushStatus = 'collected';
+            data.orderId = order._id;
+          }
+        } else {
+          console.log(`⚠️ No order found with tracking number: ${trackingNumber}`);
+          
+          // Debug: Let's see what doTrackingNumbers exist in the database
+          const allTrackingNumbers = await Order.aggregate([
+            { $match: { doTrackingNumber: { $exists: true, $ne: null } } },
+            { $project: { doTrackingNumber: 1, _id: 1 } },
+            { $limit: 10 }
+          ]);
+          
+          console.log(`🔍 Sample doTrackingNumbers in database:`, allTrackingNumbers);
+          
+          data.orderUpdated = false;
+          data.message = 'No order found with this tracking number';
+          data.searchedTrackingNumber = trackingNumber;
+        }
+      } catch (updateError) {
+        console.error('❌ Error updating order status:', updateError);
+        data.orderUpdated = false;
+        data.updateError = updateError.message;
+      }
+    } else {
+      console.log(`ℹ️ Status is not 'at_warehouse', no update needed. Current status: ${data.status}`);
+      data.orderUpdated = false;
+      data.message = `No update needed. Current status: ${data.status}`;
+    }
+    
     res.json(data);
     
   } catch (error) {
-    console.error('Error fetching DeTrack data:', error);
+    console.error('❌ Error fetching DeTrack data:', error);
     res.status(500).json({ 
       error: 'Failed to fetch DeTrack data',
       details: error.message 
     });
+  }
+});
+
+
+// Alternative: Create a separate endpoint for bulk tracking updates
+app.post('/api/detrack/bulk-update', async (req, res) => {
+  try {
+    const { trackingNumbers } = req.body;
+    
+    if (!trackingNumbers || !Array.isArray(trackingNumbers)) {
+      return res.status(400).json({ error: 'trackingNumbers array is required' });
+    }
+    
+    const results = [];
+    
+    for (const trackingNumber of trackingNumbers) {
+      try {
+        // Fetch DeTrack status
+        const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${trackingNumber}`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-KEY': process.env.DETRACK_API_KEY || 'Ude778d93ebd628e6c942a4c4f359643e9cefc1949b17d433'
+          }
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          
+          // Check if status is "at_warehouse"
+          if (data && data.status && data.status === 'at_warehouse') {
+            // Find and update order
+            const order = await Order.findOne({ trackingNumber: trackingNumber });
+            
+            if (order) {
+              await Order.findByIdAndUpdate(
+                order._id,
+                { 
+                  goRushStatus: 'collected',
+                  updatedAt: new Date()
+                },
+                { new: true, runValidators: false }
+              );
+              
+              // Add log entry
+              const logEntry = {
+                note: `Status automatically updated to 'collected' based on DeTrack status: ${data.tracking_status || data.status}`,
+                category: 'system',
+                createdBy: 'system',
+                createdAt: new Date(),
+              };
+              
+              order.logs.push(logEntry);
+              await order.save();
+              
+              results.push({
+                trackingNumber,
+                status: 'updated',
+                detrackStatus: data.status,
+                newGoRushStatus: 'collected'
+              });
+            } else {
+              results.push({
+                trackingNumber,
+                status: 'no_order_found',
+                detrackStatus: data.status
+              });
+            }
+          } else {
+            results.push({
+              trackingNumber,
+              status: 'no_update_needed',
+              detrackStatus: data.status
+            });
+          }
+        } else {
+          results.push({
+            trackingNumber,
+            status: 'detrack_error',
+            error: `API error: ${response.status}`
+          });
+        }
+      } catch (error) {
+        results.push({
+          trackingNumber,
+          status: 'error',
+          error: error.message
+        });
+      }
+    }
+    
+    res.json({
+      message: 'Bulk update completed',
+      results,
+      totalProcessed: trackingNumbers.length,
+      successfulUpdates: results.filter(r => r.status === 'updated').length
+    });
+    
+  } catch (error) {
+    console.error('Error in bulk DeTrack update:', error);
+    res.status(500).json({ 
+      error: 'Failed to process bulk update',
+      details: error.message 
+    });
+  }
+});
+
+cron.schedule('*/10 * * * *', async () => {
+  console.log(`⏰ [CRON] Running scheduled DeTrack sync at ${new Date().toISOString()}`);
+  try {
+    const result = await syncDeTrackStatuses();
+    console.log(`✅ [CRON] Scheduled sync completed. Updated ${result.updatedCount || 0} orders.`);
+    
+    if (result.updatedCount > 0) {
+      console.log(`📊 [CRON] Sync summary: ${result.updatedCount} orders updated to 'collected'`);
+    } else {
+      console.log(`ℹ️ [CRON] No orders needed status updates`);
+    }
+  } catch (error) {
+    console.error('❌ [CRON] Error in scheduled sync:', error);
+  }
+});
+
+
+async function syncDeTrackStatuses() {
+  try {
+    // Get all orders with tracking numbers that don't have "collected" status
+    const orders = await Order.find({
+      doTrackingNumber: { $exists: true, $ne: null },
+      collectionDate: { $exists: true, $ne: null },
+      goRushStatus: { $ne: 'collected' }
+    }).limit(100);
+    
+    console.log(`🔄 Starting DeTrack sync for ${orders.length} orders`);
+    
+    let updatedCount = 0;
+    let apiCalls = 0;
+    let statusMatches = 0;
+    
+    for (const order of orders) {
+      try {
+        console.log(`🔍 Processing order ${order._id} with tracking ${order.doTrackingNumber}`);
+        
+        apiCalls++;
+        const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${order.doTrackingNumber}`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-KEY': process.env.DETRACK_API_KEY || 'Ude778d93ebd628e6c942a4c4f359643e9cefc1949b17d433'
+          }
+        });
+        
+        if (!response.ok) {
+          console.error(`❌ API error for ${order.doTrackingNumber}: ${response.status}`);
+          continue;
+        }
+        
+        const { data } = await response.json();
+        console.log(`📦 DeTrack response for ${order.doTrackingNumber}:`, {
+          status: data?.status,
+          tracking_status: data?.tracking_status,
+          primary_job_status: data?.primary_job_status,
+          milestones: data?.milestones?.map(m => m.status)
+        });
+        
+const statusIndicators = [
+  data?.status,
+  data?.tracking_status,
+  data?.primary_job_status,
+  ...(data?.milestones || []).map(m => m.status)
+].filter(Boolean);
+
+console.log(`🔍 Status indicators found:`, statusIndicators);
+        
+        console.log(`🔍 Status indicators found:`, statusIndicators);
+        
+const isAtWarehouse = statusIndicators.some(status => {
+  const normalizedStatus = String(status).toLowerCase();
+  return (
+    normalizedStatus.includes('warehouse') ||
+    normalizedStatus.includes('delivered') ||
+    normalizedStatus.includes('completed') ||
+    normalizedStatus.includes('collected') ||
+    normalizedStatus === 'at_warehouse' ||
+    normalizedStatus === 'out_for_delivery' ||
+    normalizedStatus === 'head_to_delivery'
+  );
+});
+
+const hasWarehouseMilestone = data?.milestones && data.milestones.includes('at_warehouse');
+
+        
+const hasWarehouseTimestamp = data?.at_warehouse_at !== null && data?.at_warehouse_at !== undefined;
+
+console.log(`🔍 Warehouse checks:`, {
+  isAtWarehouse,
+  hasWarehouseMilestone, 
+  hasWarehouseTimestamp,
+  atWarehouseTimestamp: data?.at_warehouse_at
+});
+        
+if (isAtWarehouse || hasWarehouseMilestone || hasWarehouseTimestamp) {
+  statusMatches++;
+  console.log(`✅ Found confirmed warehouse/delivered status for ${order.doTrackingNumber}`);
+          
+          // Update order status
+          const updateData = {
+            goRushStatus: 'collected',
+            updatedAt: new Date()
+          };
+          
+          // Add detrack data for reference
+          if (data) {
+            updateData.detrackData = {
+              status: data.status,
+              trackingStatus: data.tracking_status,
+              primaryStatus: data.primary_job_status,
+              milestones: data.milestones,
+              lastUpdated: new Date()
+            };
+          }
+          
+          await Order.findByIdAndUpdate(
+            order._id,
+            updateData,
+            { new: true, runValidators: false }
+          );
+          
+          // Add log entry
+          const logEntry = {
+            note: `Status updated to 'collected' based on DeTrack status: ${statusIndicators.join(', ')}`,
+            category: 'system',
+            createdBy: 'system',
+            createdAt: new Date(),
+          };
+          
+          await Order.findByIdAndUpdate(
+            order._id,
+            { $push: { logs: logEntry } },
+            { new: true }
+          );
+          
+          updatedCount++;
+          console.log(`✅ Updated order ${order._id} to collected`);
+        } else {
+          console.log(`ℹ️ Status not indicating warehouse for ${order.doTrackingNumber}`);
+        }
+        
+        // Add small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
+      } catch (error) {
+        console.error(`❌ Error syncing order ${order._id}:`, error.message);
+      }
+    }
+    
+    console.log(`📊 Sync summary:
+    - API calls made: ${apiCalls}
+    - Orders with warehouse status: ${statusMatches}
+    - Orders updated: ${updatedCount}`);
+    
+    return { 
+      success: true, 
+      updatedCount,
+      apiCalls,
+      statusMatches
+    };
+    
+  } catch (error) {
+    console.error('❌ Error in DeTrack sync:', error);
+    return { 
+      success: false, 
+      error: error.message,
+      stack: error.stack 
+    };
+  }
+}
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// Endpoint to manually trigger sync
+app.post('/api/detrack/sync', async (req, res) => {
+  try {
+    const result = await syncDeTrackStatuses();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
