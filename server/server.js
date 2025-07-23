@@ -168,8 +168,28 @@ function extractUserRole(req, res, next) {
   next();
 }
 
-app.get('/', (req, res) => {
-  res.send('GR Pharmacy Backend is running ✅');
+app.get('/api/orders/logs', async (req, res) => {
+  try {
+    const userRole = req.headers['x-user-role'];
+    let query = {};
+    
+    // Apply role-based filtering
+    if (userRole === 'jpmc') {
+      query.product = 'pharmacyjpmc';
+    } else if (userRole === 'moh') {
+      query.product = 'pharmacymoh';
+    }
+    
+    // Fetch orders with logs
+    const orders = await Order.find(query)
+      .sort({ creationDate: -1 })
+      .lean();
+    
+    res.json(orders);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
 // Apply user role middleware to all routes
@@ -485,7 +505,45 @@ app.get('/api/detrack/:trackingNumber', async (req, res) => {
     console.log(`🔍 Checking status: ${data.status} (type: ${typeof data.status})`);
     console.log(`🔍 Checking tracking_status: ${data.tracking_status} (type: ${typeof data.tracking_status})`);
     
-    if (data && data.status && data.status === 'at_warehouse') {
+// In your /api/detrack/:trackingNumber endpoint
+if (data && data.status && data.status === 'at_warehouse') {
+  console.log(`✅ Status is 'at_warehouse', proceeding with order update`);
+  
+  try {
+    // Find order by tracking number
+    const order = await Order.findOne({
+      doTrackingNumber: trackingNumber
+    });
+    
+    if (order) {
+      if (order.goRushStatus === 'collected') {
+        console.log(`ℹ️ Order already marked as collected, skipping update`);
+        data.orderUpdated = false;
+        data.message = 'Order already marked as collected';
+      } else {
+        // Update Go Rush status to "collected" WITHOUT adding a log
+        const updatedOrder = await Order.findByIdAndUpdate(
+          order._id,
+          { 
+            goRushStatus: 'collected',
+            updatedAt: new Date()
+          },
+          { new: true, runValidators: false }
+        );
+        
+        console.log(`✅ Updated Go Rush status to 'collected' for order: ${order._id}`);
+        
+        data.orderUpdated = true;
+        data.updatedGoRushStatus = 'collected';
+        data.orderId = order._id;
+      }
+    }
+  } catch (updateError) {
+    console.error('❌ Error updating order status:', updateError);
+    data.orderUpdated = false;
+    data.updateError = updateError.message;
+  }
+
       console.log(`✅ Status is 'at_warehouse', proceeding with order update`);
       
       try {
@@ -798,21 +856,7 @@ if (isAtWarehouse || hasWarehouseMilestone || hasWarehouseTimestamp) {
             order._id,
             updateData,
             { new: true, runValidators: false }
-          );
-          
-          // Add log entry
-          const logEntry = {
-            note: `Status updated to 'collected' based on DeTrack status: ${statusIndicators.join(', ')}`,
-            category: 'system',
-            createdBy: 'system',
-            createdAt: new Date(),
-          };
-          
-          await Order.findByIdAndUpdate(
-            order._id,
-            { $push: { logs: logEntry } },
-            { new: true }
-          );
+          );      
           
           updatedCount++;
           console.log(`✅ Updated order ${order._id} to collected`);
