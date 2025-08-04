@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import compression from 'compression';
 import authRoutes from './routes/auth.js';
 import cron from 'node-cron';
+import dayjs from 'dayjs';
 
 dotenv.config();
 
@@ -58,13 +59,60 @@ pharmacyStatus: { type: String, default: 'pending' } // Status for Pharmacy team
 }, { collection: 'orders', strict: false });
 const Order = mongoose.model('Order', orderSchema);
 
+const dmsFormSchema = new mongoose.Schema({
+  formName: String,
+  formDate: String,
+  batchNo: String,
+  startNo: String,
+  endNo: String,
+  creationDate: Date,
+  mohForm: String,
+  numberOfForms: String,
+  formCreator: String,
+  orderIds: [String],
+  
+  // Add these new fields to store the complete data for re-download
+  previewData: {
+    type: mongoose.Schema.Types.Mixed, // Stores the complete preview data as JSON
+    required: true
+  },
+  htmlPreview: String, // Optional: Store HTML representation
+  
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+}, { collection: 'forms' });
+
+const DMSForm = mongoose.model('DMSForm', dmsFormSchema);
+
+
 const getDateFilter = () => {
   return {
-    creationDate: {
-      $gte: '2025-07-11'
-    }
+    $or: [
+      // MOH product orders: from 30th July onwards
+      {
+        $and: [
+          { product: 'pharmacymoh' },
+          { creationDate: { $gte: '2025-08-03' } }
+        ]
+      },
+      // All other product orders: from 11th July onwards  
+      {
+        $and: [
+          { product: { $ne: 'pharmacymoh' } },
+          { creationDate: { $gte: '2025-07-11' } }
+        ]
+      },
+      // Handle orders without product field (legacy): from 11th July onwards
+      {
+        $and: [
+          { product: { $exists: false } },
+          { creationDate: { $gte: '2025-07-11' } }
+        ]
+      }
+    ]
   };
 };
+
 
 function getProductFilter(userRole) {
   const role = (userRole || '').toLowerCase().trim();
@@ -92,9 +140,22 @@ function getProductFilter(userRole) {
     };
   }
 
-  if (role === 'gorush') {
+  // FIXED: More restrictive filter for Go Rush users
+  if (role === 'gorush' || role === 'go-rush') {
     return {
-      product: { $in: ['pharmacyjpmc'] }
+      $and: [
+        { 
+          product: { 
+            $in: ['pharmacyjpmc', 'pharmacymoh'] 
+          } 
+        },
+        // Explicitly exclude other product types
+        { 
+          product: { 
+            $nin: ['temu', 'kptdp', 'other_product'] 
+          } 
+        }
+      ]
     };
   }
 
@@ -104,8 +165,12 @@ function getProductFilter(userRole) {
 function canAccessOrder(userRole, order) {
   const role = (userRole || '').toLowerCase().trim();
   
-  // Go Rush can access any order
-  if (role === 'gorush' || role === 'go-rush') return true;
+  // Go Rush can ONLY access pharmacy orders (both JPMC and MOH)
+  if (role === 'gorush' || role === 'go-rush') {
+    // Explicit check - only allow these two product types
+    const allowedProducts = ['pharmacyjpmc', 'pharmacymoh'];
+    return allowedProducts.includes(order.product);
+  }
   
   // MOH can only access MOH orders
   if (role === 'moh') return order.product === 'pharmacymoh';
@@ -118,13 +183,15 @@ function canAccessOrder(userRole, order) {
   return false;
 }
 
-// New function for determining update permissions
 function canUpdateOrder(userRole, order, updateType) {
   const role = (userRole || '').toLowerCase().trim();
   
-  // Go Rush can update Go Rush status on any order
+  // Go Rush can update Go Rush status ONLY on pharmacy orders
   if (updateType === 'goRushStatus') {
-    return role === 'gorush' || role === 'go-rush';
+    if (role === 'gorush' || role === 'go-rush') {
+      const allowedProducts = ['pharmacyjpmc', 'pharmacymoh'];
+      return allowedProducts.includes(order.product);
+    }
   }
   
   // Pharmacy status and remarks can only be updated by the appropriate pharmacy
@@ -133,9 +200,12 @@ function canUpdateOrder(userRole, order, updateType) {
     if (role === 'jpmc') return order.product === 'pharmacyjpmc' || !order.product;
   }
   
-  // Logs can be added by Go Rush on any order
+  // Logs can be added by Go Rush ONLY on pharmacy orders
   if (updateType === 'logs') {
-    return role === 'gorush' || role === 'go-rush';
+    if (role === 'gorush' || role === 'go-rush') {
+      const allowedProducts = ['pharmacyjpmc', 'pharmacymoh'];
+      return allowedProducts.includes(order.product);
+    }
   }
   
   return false;
@@ -192,6 +262,28 @@ app.get('/api/orders/logs', async (req, res) => {
   }
 });
 
+app.get('/api/gr_dms/saved-orders', async (req, res) => {
+  try {
+    const savedOrders = await DMSForm.aggregate([
+      { $unwind: "$orderIds" },
+      { $group: { _id: null, orderIds: { $addToSet: "$orderIds" } } }
+    ]);
+    
+    const orderIds = savedOrders.length > 0 ? savedOrders[0].orderIds : [];
+    
+    res.json({ 
+      success: true,
+      orderIds 
+    });
+  } catch (error) {
+    console.error('Error fetching saved orders:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch saved orders' 
+    });
+  }
+});
+
 // Apply user role middleware to all routes
 app.use('/api', extractUserRole);
 
@@ -207,15 +299,19 @@ app.get('/api/orders', async (req, res) => {
     const combinedFilter = getCombinedFilter(req.userRole);
     const queryOptions = getQueryOptions(req.userRole);
 
-    console.log(`🏷️ User role: ${req.userRole}`);
-    console.log(`🔍 Combined filter:`, combinedFilter);
-
-    let query = Order.find(combinedFilter)
+    const orders = await Order.find(combinedFilter)
       .sort(queryOptions.sort || {});
+      
+    // Get saved orders from DMS
+    const savedOrders = await DMSForm.distinct('orderIds');
+    
+    // Add saved status to each order
+    const ordersWithStatus = orders.map(order => ({
+      ...order.toObject(),
+      isSaved: savedOrders.includes(order._id.toString())
+    }));
 
-    const orders = await query;
-    res.json(orders);
-
+    res.json(ordersWithStatus);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -347,9 +443,22 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
       updateData.collectionDate = null;
       updateData.collectionStatus = collectionStatus || 'pending';
     } 
-    // If collectionDate has a value, use it
+    // If collectionDate has a value, parse it correctly
     else if (collectionDate) {
-      updateData.collectionDate = new Date(collectionDate);
+      // Parse DD-MM-YYYY format correctly
+      const [day, month, year] = collectionDate.split('-');
+      
+      // Create date at noon UTC+8 to avoid timezone edge cases
+      const parsedDate = new Date(Date.UTC(year, month - 1, day, 4, 0, 0, 0));
+      
+      // Validate the parsed date
+      if (isNaN(parsedDate.getTime())) {
+        return res.status(400).json({ 
+          error: 'Invalid date format. Expected DD-MM-YYYY' 
+        });
+      }
+      
+      updateData.collectionDate = parsedDate;
     }
     // If collectionDate is undefined, don't modify it
     else {
@@ -364,7 +473,15 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
       { new: true }
     );
 
-    res.json(updatedOrder);
+    // Add formatted date to response
+    const responseData = updatedOrder.toObject();
+    responseData.formattedCollectionDate = updatedOrder.collectionDate ? 
+      dayjs(updatedOrder.collectionDate).format('DD-MM-YYYY') : 
+      null;
+
+    // Return the response once with all data
+    res.json(responseData);
+
   } catch (error) {
     console.error('Server error updating collection date:', error);
     res.status(500).json({ 
@@ -1112,6 +1229,220 @@ app.post('/api/orders/:id/pharmacy-remarks', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
+
+// In your backend (server.js or routes file)
+app.get('/api/gr_dms/forms', async (req, res) => {
+  try {
+    const forms = await DMSForm.find({
+      // Filter MOH forms created on or after 30th July 2025
+      $or: [
+        { 
+          mohForm: { $exists: true, $ne: null }, // MOH forms
+          createdAt: { $gte: new Date('2025-08-03') } // From 30th July
+        },
+        { 
+          mohForm: { $exists: false }, // Non-MOH forms (no date restriction)
+        }
+      ]
+    })
+    .select('formName formDate batchNo mohForm numberOfForms createdAt')
+    .sort({ createdAt: -1 });
+    
+    res.json({ success: true, forms });
+  } catch (error) {
+    console.error('Error fetching forms:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+app.get('/api/gr_dms/forms/by-order/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    console.log('API: Looking for orderId:', orderId);
+    
+    // Find form that contains this orderId in the orderIds array
+    const form = await DMSForm.findOne({ 
+      orderIds: { $in: [orderId] } // Use $in operator to search in array
+    }).sort({ createdAt: -1 }).lean();
+    
+    console.log('API: Form found:', !!form);
+    
+    if (!form) {
+      console.log('API: No form found for orderId:', orderId);
+      return res.status(404).json({ 
+        success: false,
+        error: 'No form found containing this order' 
+      });
+    }
+
+    console.log('API: Returning form with rows:', form.previewData?.rows?.length || 0);
+
+    res.json({
+      success: true,
+      form: form
+    });
+  } catch (error) {
+    console.error('API Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+app.get('/api/gr_dms/forms/:formId', async (req, res) => {
+  try {
+    const { formId } = req.params;
+    
+    const form = await DMSForm.findById(formId);
+    
+    if (!form) {
+      return res.status(404).json({
+        success: false,
+        error: 'Form not found'
+      });
+    }
+    
+    res.json({
+      success: true,
+      form: form,
+      previewData: form.previewData
+    });
+    
+  } catch (error) {
+    console.error('Error fetching form:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Fixed POST endpoint for saving forms with order updates
+app.post('/api/gr_dms/forms', async (req, res) => {
+  try {
+    const formData = req.body;
+    
+    // Validate required fields
+    if (!formData.previewData || !formData.previewData.rows) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Preview data must include rows' 
+      });
+    }
+
+    // Ensure all preview data fields exist and preserve rawData
+    const completePreviewData = {
+      rows: formData.previewData.rows.map(row => ({
+        ...row,
+        // Preserve the original rawData - this is crucial!
+        rawData: row.rawData || row, // If rawData doesn't exist, use the row itself
+        
+        // Set display fields with proper fallbacks
+        number: row.number || '',
+        patientName: row.patientName || row.rawData?.receiverName || row.receiverName || 'N/A',
+        trackingNumber: row.trackingNumber || row.rawData?.doTrackingNumber || row.doTrackingNumber || 'N/A',
+        address: row.address || row.rawData?.receiverAddress || row.receiverAddress || 'N/A',
+        deliveryCode: row.deliveryCode || getDeliveryCodePrefix(row.rawData?.jobMethod || row.jobMethod) || 'OTH',
+        
+        // Ensure we have a unique key
+        key: row.key || row._id || row.rawData?._id || generateUniqueId()
+      })),
+      summary: formData.previewData.summary || {
+        total: formData.orderIds?.length || formData.previewData.rows.length,
+        deliveryMethod: formData.mohForm || 'Standard',
+        batch: `B${formData.batchNo || 1} ${formData.startNo || 'S1'}-${formData.endNo || 'S' + (formData.orderIds?.length || formData.previewData.rows.length)}`,
+        formDate: dayjs().format('DD.MM.YY')
+      },
+      meta: formData.previewData.meta || {
+        jobMethod: formData.mohForm || 'Standard',
+        batchNo: formData.batchNo || '1',
+        startNo: formData.startNo || 'S1',
+        endNo: formData.endNo || `S${formData.orderIds?.length || formData.previewData.rows.length}`,
+        formDate: dayjs().format('DD.MM.YY')
+      }
+    };
+
+    // Create new DMS form document
+    const newForm = new DMSForm({
+      formName: formData.formName,
+      formDate: formData.formDate,
+      batchNo: formData.batchNo,
+      startNo: formData.startNo,
+      endNo: formData.endNo,
+      creationDate: new Date(),
+      mohForm: formData.mohForm,
+      numberOfForms: formData.numberOfForms || formData.orderIds?.length || completePreviewData.rows.length,
+      formCreator: formData.formCreator,
+      orderIds: formData.orderIds || [],
+      previewData: completePreviewData,
+      htmlPreview: formData.htmlPreview
+    });
+
+    // Save the form first
+    const savedForm = await newForm.save();
+    
+    // Extract tracking numbers from the form data
+    const trackingNumbers = completePreviewData.rows
+      .map(row => row.trackingNumber || row.rawData?.doTrackingNumber || row.doTrackingNumber)
+      .filter(trackingNumber => trackingNumber && trackingNumber !== 'N/A');
+
+    console.log('Updating orders for tracking numbers:', trackingNumbers);
+
+    // Update orders collection - set pharmacyFormCreated to 'yes' for all matching tracking numbers
+    if (trackingNumbers.length > 0) {
+      const updateResult = await Order.updateMany(
+        { doTrackingNumber: { $in: trackingNumbers } },
+        { 
+          $set: { 
+            pharmacyFormCreated: 'yes',
+            formCreatedDate: new Date(),
+            formId: savedForm._id // Optional: link back to the form
+          } 
+        }
+      );
+      
+      console.log(`Updated ${updateResult.modifiedCount} orders with pharmacyFormCreated = 'yes'`);
+      
+      // Log any tracking numbers that weren't found
+      if (updateResult.modifiedCount < trackingNumbers.length) {
+        const updatedOrders = await Order.find(
+          { doTrackingNumber: { $in: trackingNumbers } },
+          { doTrackingNumber: 1 }
+        );
+        const updatedTrackingNumbers = updatedOrders.map(order => order.doTrackingNumber);
+        const notFoundTrackingNumbers = trackingNumbers.filter(tn => !updatedTrackingNumbers.includes(tn));
+        console.log('Tracking numbers not found in orders collection:', notFoundTrackingNumbers);
+      }
+    }
+    
+    res.status(201).json({ 
+      success: true, 
+      message: 'Form saved to DMS successfully and orders updated',
+      form: savedForm,
+      formId: savedForm._id,
+      ordersUpdated: trackingNumbers.length > 0 ? true : false,
+      trackingNumbersProcessed: trackingNumbers.length
+    });
+    
+  } catch (error) {
+    console.error('Error saving to DMS or updating orders:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error',
+      details: error.message 
+    });
+  }
+});
+
+// Helper function to ensure unique IDs
+function generateUniqueId() {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
 
 const port = process.env.PORT || 5050;
 app.listen(port, () => {
