@@ -1400,7 +1400,7 @@ app.post('/api/gr_dms/forms', async (req, res) => {
         { doTrackingNumber: { $in: trackingNumbers } },
         { 
           $set: { 
-            pharmacyFormCreated: 'yes',
+            pharmacyFormCreated: 'Yes',
             formCreatedDate: new Date(),
             formId: savedForm._id // Optional: link back to the form
           } 
