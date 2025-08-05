@@ -38,7 +38,7 @@ mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
 
 // Define schema + model
 const orderSchema = new mongoose.Schema({
-  product: { type: String, enum: ['pharmacyjpmc'], index: true},
+  product: { type: String, enum: ['pharmacyjpmc', 'pharmacymoh'], index: true},
   logs: [
   {
     note: { type: String, required: true },
@@ -114,6 +114,106 @@ const getDateFilter = () => {
   };
 };
 
+app.put('/api/detrack/:trackingNumber/cancel', async (req, res) => {
+  try {
+    const { trackingNumber } = req.params;
+    
+    if (!trackingNumber) {
+      return res.status(400).json({ error: 'Tracking number is required' });
+    }
+
+    console.log(`🔍 Cancelling DeTrack job for tracking number: ${trackingNumber}`);
+
+    // Find the order first
+    const order = await Order.findOne({ doTrackingNumber: trackingNumber });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // DeTrack API call with correct nested data structure - ONLY update tracking status
+    const detrackRequestBody = {
+      data: {
+        tracking_status: 'Cancelled',  // Capitalized tracking status
+        status: 'cancelled'            // Lowercase internal status
+      }
+    };
+
+    console.log('DeTrack API Request:', {
+      url: `https://app.detrack.com/api/v2/dn/jobs/update/?do_number=${trackingNumber}`,
+      method: 'PUT',
+      body: detrackRequestBody
+    });
+
+    const detrackResponse = await fetch(`https://app.detrack.com/api/v2/dn/jobs/update/?do_number=${trackingNumber}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-KEY': process.env.DETRACK_API_KEY || 'Ude778d93ebd628e6c942a4c4f359643e9cefc1949b17d433'
+      },
+      body: JSON.stringify(detrackRequestBody)
+    });
+
+    let detrackData = null;
+    let detrackError = null;
+
+    if (!detrackResponse.ok) {
+      const errorText = await detrackResponse.text();
+      console.error('DeTrack API error:', detrackResponse.status, errorText);
+      detrackError = `DeTrack API error: ${detrackResponse.status} ${detrackResponse.statusText}`;
+      
+      // Log the error but don't fail the entire operation
+      console.warn('DeTrack update failed but continuing with local cancellation');
+    } else {
+      try {
+        detrackData = await detrackResponse.json();
+        console.log('DeTrack update successful:', detrackData);
+      } catch (parseError) {
+        console.warn('Failed to parse DeTrack response, but status update may have succeeded');
+      }
+    }
+
+    // Only update the currentStatus in our database, don't touch other fields
+    const updatedOrder = await Order.findByIdAndUpdate(
+      order._id,
+      { 
+        currentStatus: 'cancelled',
+        updatedAt: new Date()
+      },
+      { new: true, runValidators: false } // Skip validation to avoid enum errors
+    );
+
+    // Add a log entry for this cancellation
+    const logEntry = {
+      note: detrackError 
+        ? `DeTrack update failed: ${detrackError}. Order status updated locally to cancelled.` 
+        : `DeTrack tracking status updated to 'Cancelled'. Order status updated locally to cancelled.`,
+      category: 'Status Update',
+      createdBy: req.headers['x-user-role'] || 'system',
+      createdAt: new Date(),
+    };
+
+    updatedOrder.logs.push(logEntry);
+    await updatedOrder.save();
+
+    res.json({
+      success: true,
+      message: detrackError 
+        ? 'Order cancelled locally, but DeTrack update failed' 
+        : 'DeTrack tracking status updated to cancelled',
+      order: updatedOrder,
+      detrackResponse: detrackData,
+      detrackError: detrackError
+    });
+
+  } catch (error) {
+    console.error('Error cancelling order:', error);
+    res.status(500).json({ 
+      error: 'Failed to cancel order',
+      details: error.message 
+    });
+  }
+});
 
 function getProductFilter(userRole) {
   const role = (userRole || '').toLowerCase().trim();
@@ -375,41 +475,52 @@ app.get('/api/customers/:patientNumber/orders', async (req, res) => {
   }
 });
 
-app.put('/api/orders/bulk-go-rush-status', async (req, res) => {
+app.put('/api/orders/:id/go-rush-status', async (req, res) => {
   try {
-    const { orderIds, status } = req.body;
-    const userRole = req.headers['x-user-role'];
+    const { id } = req.params;
+    const { status, currentStatus } = req.body;
 
-    // Validate input
-    if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) {
-      return res.status(400).json({ error: 'Invalid order IDs' });
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid order ID' });
     }
 
-    if (!status || !['pending', 'in progress', 'ready', 'collected', 'completed', 'cancelled'].includes(status)) {
-      return res.status(400).json({ error: 'Invalid status' });
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
     }
 
-    // Check user role
-    if (userRole !== 'gorush') {
-      return res.status(403).json({ error: 'Only Go Rush users can perform bulk updates' });
+    // First find the order
+    const order = await Order.findById(id);
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
     }
 
-    // Update all orders
-    const result = await Order.updateMany(
-      { _id: { $in: orderIds } },
-      { 
-        goRushStatus: status,
-        updatedAt: new Date()
-      }
+    // Check if user can update this order
+    if (!canUpdateOrder(req.userRole, order, 'goRushStatus')) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const updateData = { 
+      goRushStatus: status,
+      updatedAt: new Date()
+    };
+
+    // Update currentStatus if provided or if status is cancelled
+    if (currentStatus) {
+      updateData.currentStatus = currentStatus;
+    } else if (status.toLowerCase() === 'cancelled') {
+      updateData.currentStatus = 'Cancelled';
+    }
+
+    const updatedOrder = await Order.findByIdAndUpdate(
+      id,
+      updateData,
+      { new: true, runValidators: false }
     );
 
-    res.json({
-      message: 'Bulk update successful',
-      modifiedCount: result.modifiedCount
-    });
+    res.json(updatedOrder);
 
   } catch (error) {
-    console.error('Error during bulk update:', error);
+    console.error('Error updating Go Rush status:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1072,7 +1183,6 @@ app.put('/api/orders/:id/go-rush-status', async (req, res) => {
   }
 });
 
-// UPDATED: Pharmacy Status with proper permission checking
 app.put('/api/orders/:id/pharmacy-status', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1097,12 +1207,19 @@ app.put('/api/orders/:id/pharmacy-status', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    const updateData = { 
+      pharmacyStatus: status,
+      updatedAt: new Date()
+    };
+
+    // If status is cancelled, also update currentStatus
+    if (status.toLowerCase() === 'cancelled') {
+      updateData.currentStatus = 'cancelled';
+    }
+
     const updatedOrder = await Order.findByIdAndUpdate(
       id,
-      { 
-        pharmacyStatus: status,
-        updatedAt: new Date()
-      },
+      updateData,
       { new: true, runValidators: false }
     );
 
