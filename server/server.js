@@ -93,7 +93,7 @@ const getDateFilter = () => {
       {
         $and: [
           { product: 'pharmacymoh' },
-          { creationDate: { $gte: '2025-08-03' } }
+          { creationDate: { $gte: '2025-08-06' } }
         ]
       },
       // All other product orders: from 11th July onwards  
@@ -1358,7 +1358,7 @@ app.get('/api/gr_dms/forms', async (req, res) => {
       $or: [
         { 
           mohForm: { $exists: true, $ne: null }, // MOH forms
-          createdAt: { $gte: new Date('2025-08-03') } // From 30th July
+          createdAt: { $gte: new Date('2025-08-06') } // From 30th July
         },
         { 
           mohForm: { $exists: false }, // Non-MOH forms (no date restriction)
