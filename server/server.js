@@ -234,14 +234,28 @@ function getProductFilter(userRole) {
 
   if (role === 'jpmc') {
     return { 
-      $or: [
-        { product: 'pharmacyjpmc' },
-        { product: { $exists: false } } // Include legacy orders
+      $and: [
+        { 
+          $or: [
+            { product: 'pharmacyjpmc' },
+            { 
+              $and: [
+                { product: { $exists: false } },
+                { creationDate: { $lt: new Date('2025-07-11') } }
+              ]
+            }
+          ]
+        },
+        { 
+          $or: [
+            { doTrackingNumber: { $regex: /JP/i } },
+            { doTrackingNumber: { $exists: false } } // Include orders without tracking number
+          ]
+        }
       ]
     };
   }
 
-  // FIXED: More restrictive filter for Go Rush users
   if (role === 'gorush' || role === 'go-rush') {
     return {
       $and: [
@@ -250,7 +264,6 @@ function getProductFilter(userRole) {
             $in: ['pharmacyjpmc', 'pharmacymoh'] 
           } 
         },
-        // Explicitly exclude other product types
         { 
           product: { 
             $nin: ['temu', 'kptdp', 'other_product'] 
@@ -260,7 +273,7 @@ function getProductFilter(userRole) {
     };
   }
 
-  return {};
+  return { product: 'pharmacyjpmc' };
 }
 
 function canAccessOrder(userRole, order) {
