@@ -541,29 +541,21 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    // Check if user can access this order
-    if (!canAccessOrder(req.userRole, order)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
     const updateData = {
-      updatedAt: new Date()
+      updatedAt: new Date(),
+      collectionStatus: collectionStatus || 'pending'
     };
 
-    // Explicitly check if collectionDate is null or empty string
     if (collectionDate === null || collectionDate === '') {
       updateData.collectionDate = null;
-      updateData.collectionStatus = collectionStatus || 'pending';
     } 
-    // If collectionDate has a value, parse it correctly
     else if (collectionDate) {
       // Parse DD-MM-YYYY format correctly
       const [day, month, year] = collectionDate.split('-');
       
-      // Create date at noon UTC+8 to avoid timezone edge cases
-      const parsedDate = new Date(Date.UTC(year, month - 1, day, 4, 0, 0, 0));
+      // Create date in UTC to avoid timezone issues
+      const parsedDate = new Date(Date.UTC(year, month - 1, day));
       
-      // Validate the parsed date
       if (isNaN(parsedDate.getTime())) {
         return res.status(400).json({ 
           error: 'Invalid date format. Expected DD-MM-YYYY' 
@@ -572,12 +564,6 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
       
       updateData.collectionDate = parsedDate;
     }
-    // If collectionDate is undefined, don't modify it
-    else {
-      return res.status(400).json({ 
-        error: 'Missing collectionDate in request body' 
-      });
-    }
 
     const updatedOrder = await Order.findByIdAndUpdate(
       id,
@@ -585,13 +571,12 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
       { new: true }
     );
 
-    // Add formatted date to response
+    // Return formatted date in response
     const responseData = updatedOrder.toObject();
     responseData.formattedCollectionDate = updatedOrder.collectionDate ? 
       dayjs(updatedOrder.collectionDate).format('DD-MM-YYYY') : 
       null;
 
-    // Return the response once with all data
     res.json(responseData);
 
   } catch (error) {
