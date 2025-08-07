@@ -89,11 +89,10 @@ const DMSForm = mongoose.model('DMSForm', dmsFormSchema);
 const getDateFilter = () => {
   return {
     $or: [
-      // MOH product orders: from 30th July onwards
       {
         $and: [
           { product: 'pharmacymoh' },
-          { creationDate: { $gte: '2025-08-05' } }
+          { creationDate: { $gte: '2025-08-07' } }
         ]
       },
       // All other product orders: from 11th July onwards  
