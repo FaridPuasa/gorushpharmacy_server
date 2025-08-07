@@ -600,40 +600,39 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
   }
 });
 
-app.get('/api/collection-dates', async (req, res) => {
+app.get('/api/orders/collection-dates', async (req, res) => {
   try {
+    const { date } = req.query;
+    
+    if (!date) {
+      return res.status(400).json({ error: 'Date parameter is required' });
+    }
+
+    const startDate = new Date(date);
+    const endDate = new Date(date);
+    endDate.setDate(endDate.getDate() + 1);
+    
     const combinedFilter = getCombinedFilter(req.userRole);
     
-    const matchCondition = {
-      collectionDate: { $exists: true, $ne: null },
-      ...combinedFilter
+    // Add filter for collection dates from August 6th onwards
+    const collectionDateFilter = {
+      collectionDate: { 
+        $gte: new Date('2025-08-06'), // Only include collection dates from Aug 6th
+        $gte: startDate,
+        $lt: endDate
+      }
     };
-    
-    let aggregationPipeline = [
-      { $match: matchCondition },
-      { $sort: { creationDate: -1 } },
-      {
-        $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$collectionDate" } },
-          count: { $sum: 1 }
-        }
-      },
-      {
-        $project: {
-          dateString: "$_id",
-          date: { $toDate: "$_id" },
-          orderCount: "$count",
-          _id: 0
-        }
-      },
-      { $sort: { date: 1 } }
-    ];
-    
-    const dates = await Order.aggregate(aggregationPipeline);
-    
-    res.json(dates);
+
+    let query = Order.find({
+      ...collectionDateFilter,
+      ...combinedFilter
+    }).sort({ collectionDate: 1 });
+
+    const orders = await query;
+
+    res.json(orders);
   } catch (error) {
-    console.error('Error fetching collection dates:', error);
+    console.error('Error fetching orders for date:', error);
     res.status(500).json({ error: error.message });
   }
 });
