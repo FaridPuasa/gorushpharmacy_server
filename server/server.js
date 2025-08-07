@@ -600,67 +600,72 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
   }
 });
 
-app.get('/api/orders/collection-dates', async (req, res) => {
+app.get('/api/collection-dates', async (req, res) => {
   try {
-    const { date } = req.query;
+    const july2025 = new Date('2025-08-07T00:00:00Z');
     
-    if (!date) {
-      return res.status(400).json({ error: 'Date parameter is required' });
-    }
+    const dates = await Order.aggregate([
+      { 
+        $match: { 
+          collectionDate: { 
+            $exists: true, 
+            $ne: null,
+            $gte: july2025
+          }
+        } 
+      },
+      { 
+        $project: {
+          dateOnly: {
+            $dateToString: { 
+              format: "%Y-%m-%d", 
+              date: "$collectionDate" 
+            }
+          }
+        }
+      },
+      { 
+        $group: {
+          _id: "$dateOnly",
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
 
-    const startDate = new Date(date);
-    const endDate = new Date(date);
-    endDate.setDate(endDate.getDate() + 1);
-    
-    const combinedFilter = getCombinedFilter(req.userRole);
-    
-    // Add filter for collection dates from August 6th onwards
-    const collectionDateFilter = {
-      collectionDate: { 
-        $gte: new Date('2025-08-06'), // Only include collection dates from Aug 6th
-        $gte: startDate,
-        $lt: endDate
-      }
-    };
-
-    let query = Order.find({
-      ...collectionDateFilter,
-      ...combinedFilter
-    }).sort({ collectionDate: 1 });
-
-    const orders = await query;
-
-    res.json(orders);
+    res.json(dates.map(d => ({
+      dateString: d._id,
+      count: d.count
+    })));
   } catch (error) {
-    console.error('Error fetching orders for date:', error);
+    console.error('Error fetching collection dates:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get orders for a specific collection date
 app.get('/api/orders/collection-dates', async (req, res) => {
   try {
     const { date } = req.query;
-    
     if (!date) {
       return res.status(400).json({ error: 'Date parameter is required' });
     }
 
+    // Create start and end of day in UTC
     const startDate = new Date(date);
+    startDate.setUTCHours(0, 0, 0, 0);
+    
     const endDate = new Date(date);
-    endDate.setDate(endDate.getDate() + 1);
+    endDate.setUTCHours(23, 59, 59, 999);
+
+    const combinedFilter = getCombinedFilter(req.headers['x-user-role']);
     
-    const combinedFilter = getCombinedFilter(req.userRole);
-    
-    let query = Order.find({
+    const orders = await Order.find({
       collectionDate: {
         $gte: startDate,
-        $lt: endDate
+        $lte: endDate
       },
       ...combinedFilter
     }).sort({ collectionDate: 1 });
-
-    const orders = await query;
 
     res.json(orders);
   } catch (error) {
