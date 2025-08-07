@@ -93,7 +93,7 @@ const getDateFilter = () => {
       {
         $and: [
           { product: 'pharmacymoh' },
-          { creationDate: { $gte: '2025-08-06' } }
+          { creationDate: { $gte: '2025-08-05' } }
         ]
       },
       // All other product orders: from 11th July onwards  
