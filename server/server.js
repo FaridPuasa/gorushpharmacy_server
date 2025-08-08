@@ -176,7 +176,7 @@ app.put('/api/detrack/:trackingNumber/cancel', async (req, res) => {
     const updatedOrder = await Order.findByIdAndUpdate(
       order._id,
       { 
-        currentStatus: 'cancelled',
+        currentStatus: 'Cancelled',
         updatedAt: new Date()
       },
       { new: true, runValidators: false } // Skip validation to avoid enum errors
