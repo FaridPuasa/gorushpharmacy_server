@@ -172,21 +172,24 @@ app.put('/api/detrack/:trackingNumber/cancel', async (req, res) => {
       }
     }
 
-    // Only update the currentStatus in our database, don't touch other fields
+    // Update the currentStatus and pharmacyFormCreated in our database
+    const updateFields = { 
+      currentStatus: 'Cancelled',
+      updatedAt: new Date(),
+      pharmacyFormCreated: 'Yes' // Add this field when cancelling
+    };
+
     const updatedOrder = await Order.findByIdAndUpdate(
       order._id,
-      { 
-        currentStatus: 'Cancelled',
-        updatedAt: new Date()
-      },
+      updateFields,
       { new: true, runValidators: false } // Skip validation to avoid enum errors
     );
 
     // Add a log entry for this cancellation
     const logEntry = {
       note: detrackError 
-        ? `DeTrack update failed: ${detrackError}. Order status updated locally to cancelled.` 
-        : `DeTrack tracking status updated to 'Cancelled'. Order status updated locally to cancelled.`,
+        ? `DeTrack update failed: ${detrackError}. Order status updated locally to cancelled and marked as form created.` 
+        : `DeTrack tracking status updated to 'Cancelled'. Order status updated locally to cancelled and marked as form created.`,
       category: 'Status Update',
       createdBy: req.headers['x-user-role'] || 'system',
       createdAt: new Date(),
@@ -198,8 +201,8 @@ app.put('/api/detrack/:trackingNumber/cancel', async (req, res) => {
     res.json({
       success: true,
       message: detrackError 
-        ? 'Order cancelled locally, but DeTrack update failed' 
-        : 'DeTrack tracking status updated to cancelled',
+        ? 'Order cancelled locally and marked as form created, but DeTrack update failed' 
+        : 'DeTrack tracking status updated to cancelled and order marked as form created',
       order: updatedOrder,
       detrackResponse: detrackData,
       detrackError: detrackError
