@@ -93,7 +93,7 @@ const getDateFilter = () => {
       {
         $and: [
           { product: 'pharmacymoh' },
-          { creationDate: { $gte: '2025-08-07' } }
+          { creationDate: { $gte: '2025-08-06' } }
         ]
       },
       // All other product orders: from 11th July onwards  
@@ -113,6 +113,85 @@ const getDateFilter = () => {
     ]
   };
 };
+
+// Add this to your server.js
+app.put('/api/orders/:id/payment', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { paymentAmount, doTrackingNumber } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid order ID' });
+    }
+
+    if (typeof paymentAmount !== 'number' || isNaN(paymentAmount)) {
+      return res.status(400).json({ error: 'Valid payment amount is required' });
+    }
+
+    // First update our database
+    const updatedOrder = await Order.findByIdAndUpdate(
+      id,
+      { paymentAmount },
+      { new: true }
+    );
+
+    // If we have a tracking number, update DeTrack
+    if (doTrackingNumber) {
+      try {
+        const detrackRequestBody = {
+          data: {
+            payment_amount: paymentAmount
+          }
+        };
+
+        const detrackResponse = await fetch(`https://app.detrack.com/api/v2/dn/jobs/update/?do_number=${doTrackingNumber}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-KEY': process.env.DETRACK_API_KEY || 'Ude778d93ebd628e6c942a4c4f359643e9cefc1949b17d433'
+          },
+          body: JSON.stringify(detrackRequestBody)
+        });
+
+        if (!detrackResponse.ok) {
+          const errorText = await detrackResponse.text();
+          console.error('DeTrack API error:', detrackResponse.status, errorText);
+          return res.json({
+            order: updatedOrder,
+            detrackUpdate: false,
+            message: 'Order updated but DeTrack update failed'
+          });
+        }
+
+        const detrackData = await detrackResponse.json();
+        console.log('DeTrack payment amount updated:', detrackData);
+        
+        return res.json({
+          order: updatedOrder,
+          detrackUpdate: true,
+          detrackData
+        });
+
+      } catch (detrackError) {
+        console.error('Error updating DeTrack payment amount:', detrackError);
+        return res.json({
+          order: updatedOrder,
+          detrackUpdate: false,
+          detrackError: detrackError.message
+        });
+      }
+    }
+
+    res.json(updatedOrder);
+
+  } catch (error) {
+    console.error('Error updating payment amount:', error);
+    res.status(500).json({ 
+      error: 'Failed to update payment amount',
+      details: error.message 
+    });
+  }
+});
 
 app.put('/api/detrack/:trackingNumber/cancel', async (req, res) => {
   try {
