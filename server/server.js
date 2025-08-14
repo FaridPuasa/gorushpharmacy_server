@@ -6,6 +6,8 @@ import compression from 'compression';
 import authRoutes from './routes/auth.js';
 import cron from 'node-cron';
 import dayjs from 'dayjs';
+import axios from 'axios';
+import moment from 'moment';
 
 dotenv.config();
 
@@ -189,6 +191,269 @@ app.put('/api/orders/:id/payment', async (req, res) => {
     res.status(500).json({ 
       error: 'Failed to update payment amount',
       details: error.message 
+    });
+  }
+});
+
+
+app.get('/api/orders/search', async (req, res) => {
+  try {
+    console.log('=== SEARCH REQUEST ===');
+    console.log('Raw query params:', req.query);
+    
+    // Extract the search parameters directly from query
+    const { patientNumber, icPassNum, receiverPhoneNumber } = req.query;
+    
+    // Determine which field was provided
+    let field, value;
+    if (patientNumber) {
+      field = 'patientNumber';
+      value = patientNumber;
+    } else if (icPassNum) {
+      field = 'icPassNum';
+      value = icPassNum;
+    } else if (receiverPhoneNumber) {
+      field = 'receiverPhoneNumber';
+      value = receiverPhoneNumber;
+    } else {
+      console.log('No valid search parameter provided');
+      return res.status(400).json({ error: 'Please provide patientNumber, icPassNum, or receiverPhoneNumber' });
+    }
+
+    console.log(`Searching by ${field} = "${value}"`);
+
+    // Create the query object
+    const query = {};
+    
+    // For IC/Passport number, search both icPassNum and passport fields
+    if (field === 'icPassNum') {
+      query.$or = [
+        { icPassNum: value },
+        { passport: value }
+      ];
+    } else {
+      query[field] = value;
+    }
+
+    console.log('MongoDB query:', JSON.stringify(query, null, 2));
+    console.log('Collection name:', Order.collection.name);
+
+    // First, let's check if there are any orders at all
+    const totalOrders = await Order.countDocuments({});
+    console.log(`Total orders in collection: ${totalOrders}`);
+
+    // Search without date restrictions
+    const orders = await Order.find(query)
+      .sort({ creationDate: -1 })
+      .limit(100)
+      .lean(); // Use lean() for better performance
+
+    console.log(`Found ${orders.length} matching orders`);
+    
+    if (orders.length > 0) {
+      console.log('First matching order:', {
+        _id: orders[0]._id,
+        patientNumber: orders[0].patientNumber,
+        icPassNum: orders[0].icPassNum,
+        passport: orders[0].passport,
+        receiverPhoneNumber: orders[0].receiverPhoneNumber,
+        receiverName: orders[0].receiverName
+      });
+    }
+
+    // If no results, let's check for similar values (case-insensitive search)
+    if (orders.length === 0) {
+      console.log('No exact matches found, trying case-insensitive search...');
+      
+      let caseInsensitiveQuery = {};
+      if (field === 'icPassNum') {
+        caseInsensitiveQuery.$or = [
+          { icPassNum: { $regex: new RegExp(`^${value}$`, 'i') } },
+          { passport: { $regex: new RegExp(`^${value}$`, 'i') } }
+        ];
+      } else {
+        caseInsensitiveQuery[field] = { $regex: new RegExp(`^${value}$`, 'i') };
+      }
+      
+      const caseInsensitiveResults = await Order.find(caseInsensitiveQuery)
+        .sort({ creationDate: -1 })
+        .limit(100)
+        .lean();
+        
+      console.log(`Case-insensitive search found ${caseInsensitiveResults.length} orders`);
+      
+      if (caseInsensitiveResults.length > 0) {
+        console.log('Note: Found results with case-insensitive search. Consider updating your search to be case-insensitive by default.');
+      }
+    }
+
+    console.log('=== END SEARCH REQUEST ===\n');
+    res.json(orders);
+  } catch (error) {
+    console.error('Search error:', error);
+    res.status(500).json({ error: 'Failed to search orders' });
+  }
+});
+
+app.post('/api/orders/reorder-webhook-only', async (req, res) => {
+  try {
+    const { originalOrderId, jobMethod, paymentMethod, remarks } = req.body;
+    const userRole = req.headers['x-user-role'] || 'system';
+
+    if (!mongoose.Types.ObjectId.isValid(originalOrderId)) {
+      return res.status(400).json({ error: 'Invalid original order ID' });
+    }
+
+    // Find the original order
+    const originalOrder = await Order.findById(originalOrderId);
+    if (!originalOrder) {
+      return res.status(404).json({ error: 'Original order not found' });
+    }
+
+    // Calculate delivery type and start date based on job method
+    let deliveryTypeCode, startDate;
+    if ((jobMethod == "Standard") || (jobMethod == "Self Collect")) {
+      deliveryTypeCode = "STD";
+      startDate = moment().add(2, 'days').format('YYYY-MM-DD');
+    } else if (jobMethod == "Express") {
+      deliveryTypeCode = "EXP";
+      startDate = moment().add(1, 'day').format('YYYY-MM-DD');
+    } else if (jobMethod == "Same Day" || jobMethod == "Immediate") {
+      deliveryTypeCode = "IMM";
+      startDate = moment().format('YYYY-MM-DD');
+    }
+
+    // Function to calculate price based on job method
+    const getPrice = (method) => {
+      switch(method) {
+        case 'Standard': return 10.00;
+        case 'Express': return 15.00;
+        case 'Same Day': 
+        case 'Immediate': return 20.00;
+        case 'Self Collect': return 5.00;
+        default: return 10.00;
+      }
+    };
+
+    // Prepare data for Make (formerly Integromat) - WEBHOOK ONLY, NO DATABASE SAVE
+    const webhookData = {
+      area: originalOrder.area,
+      icNum: originalOrder.icNum,
+      items: [
+        {
+          quantity: 1,
+          description: "Medicine",
+          totalItemPrice: getPrice(jobMethod)
+        }
+      ],
+      remarks: remarks || '',
+      passport: originalOrder.passport,
+      attempt: 1,
+      jobType: originalOrder.jobType,
+      product: originalOrder.product,
+      icPassNum: originalOrder.icPassNum,
+      jobMethod: jobMethod || 'Standard',
+      startDate,
+      jobDate: "N/A",
+      totalPrice: getPrice(jobMethod),
+      dateOfBirth: originalOrder.dateOfBirth,
+      sendOrderTo: originalOrder.sendOrderTo,
+      creationDate: moment().format('YYYY-MM-DD'),
+      receiverName: originalOrder.receiverName,
+      trackingLink: "N/A",
+      currentStatus: "Info Received",
+      patientNumber: originalOrder.patientNumber,
+      payingPatient: originalOrder.payingPatient,
+      paymentamount: getPrice(jobMethod),
+      paymentMethod: paymentMethod || 'Cash',
+      receiverEmail: originalOrder.receiverEmail,
+      warehouseEntry: "No",
+      receiverAddress: originalOrder.receiverAddress,
+      appointmentPlace: originalOrder.appointmentPlace,
+      deliveryTypeCode,
+      dateTimeSubmission: moment().utcOffset('+08:00').format('DD-MM-YYYY hh:mm a'),
+      lastUpdateDateTime: moment().utcOffset('+08:00').format('DD-MM-YYYY hh:mm a'),
+      receiverPostalCode: originalOrder.receiverPostalCode,
+      appointmentDistrict: originalOrder.appointmentDistrict,
+      pharmacyFormCreated: "No",
+      receiverPhoneNumber: originalOrder.receiverPhoneNumber,
+      additionalPhoneNumber: originalOrder.additionalPhoneNumber,
+      warehouseEntryDateTime: "N/A",
+      // Additional fields for webhook
+      event: 'order_recreated',
+      timestamp: new Date().toISOString(),
+      originalOrderId: originalOrder._id,
+      reorderSource: 'manual_reorder',
+      processedBy: userRole
+    };
+
+    // WEBHOOK ONLY - No database operations
+    if (!process.env.INTEGROMAT_WEBHOOK_URL) {
+      return res.status(500).json({ 
+        success: false,
+        error: 'Webhook URL not configured',
+        details: 'INTEGROMAT_WEBHOOK_URL environment variable is missing'
+      });
+    }
+
+    // Trigger webhook to Make (Integromat)
+    try {
+      const webhookResponse = await axios.post(process.env.INTEGROMAT_WEBHOOK_URL, webhookData, {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Source': 'reorder-system'
+        },
+        timeout: 30000 // 30 second timeout
+      });
+
+      console.log('Webhook delivered successfully:', {
+        status: webhookResponse.status,
+        orderId: originalOrder._id,
+        timestamp: new Date().toISOString()
+      });
+
+      res.status(200).json({
+        success: true,
+        message: 'Reorder webhook triggered successfully',
+        webhookStatus: webhookResponse.status,
+        data: {
+          originalOrderId: originalOrder._id,
+          patientNumber: originalOrder.patientNumber,
+          jobMethod: jobMethod,
+          paymentMethod: paymentMethod,
+          totalPrice: getPrice(jobMethod),
+          startDate: startDate,
+          timestamp: webhookData.timestamp
+        }
+      });
+
+    } catch (webhookError) {
+      console.error('Webhook delivery failed:', {
+        error: webhookError.message,
+        orderId: originalOrder._id,
+        timestamp: new Date().toISOString(),
+        webhookUrl: process.env.INTEGROMAT_WEBHOOK_URL
+      });
+
+      res.status(500).json({ 
+        success: false,
+        error: 'Webhook delivery failed',
+        details: webhookError.message,
+        retryable: true
+      });
+    }
+
+  } catch (error) {
+    console.error('Error in reorder webhook endpoint:', {
+      error: error.message,
+      stack: error.stack,
+      timestamp: new Date().toISOString()
+    });
+    
+    res.status(500).json({ 
+      success: false,
+      error: 'Internal server error',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Webhook processing failed'
     });
   }
 });
@@ -1523,6 +1788,9 @@ app.get('/api/gr_dms/forms/:formId', async (req, res) => {
     });
   }
 });
+
+
+
 
 // Fixed POST endpoint for saving forms with order updates
 app.post('/api/gr_dms/forms', async (req, res) => {
