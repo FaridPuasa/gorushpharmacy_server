@@ -838,56 +838,6 @@ app.get('/api/customers/:patientNumber/orders', async (req, res) => {
   }
 });
 
-app.put('/api/orders/:id/go-rush-status', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status, currentStatus } = req.body;
-
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ error: 'Invalid order ID' });
-    }
-
-    if (!status) {
-      return res.status(400).json({ error: 'Status is required' });
-    }
-
-    // First find the order
-    const order = await Order.findById(id);
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    // Check if user can update this order
-    if (!canUpdateOrder(req.userRole, order, 'goRushStatus')) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const updateData = { 
-      goRushStatus: status,
-      updatedAt: new Date()
-    };
-
-    // Update currentStatus if provided or if status is cancelled
-    if (currentStatus) {
-      updateData.currentStatus = currentStatus;
-    } else if (status.toLowerCase() === 'cancelled') {
-      updateData.currentStatus = 'Cancelled';
-    }
-
-    const updatedOrder = await Order.findByIdAndUpdate(
-      id,
-      updateData,
-      { new: true, runValidators: false }
-    );
-
-    res.json(updatedOrder);
-
-  } catch (error) {
-    console.error('Error updating Go Rush status:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 
 app.put('/api/orders/:id/collection-date', async (req, res) => {
   try {
