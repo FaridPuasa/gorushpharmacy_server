@@ -36,9 +36,12 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const uri = process.env.MONGO_URI;
 
 mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => console.log("✅ MongoDB connected"))
+  .then(async () => {
+    console.log("✅ MongoDB connected");
+    // Run initial collection date sync
+    await initializeCollectionDateSync();
+  })
   .catch(err => console.error("❌ MongoDB connection error:", err));
-
 // Define schema + model
 const orderSchema = new mongoose.Schema({
   product: { type: String, enum: ['pharmacyjpmc', 'pharmacymoh'], index: true},
@@ -1331,6 +1334,31 @@ cron.schedule('*/10 * * * *', async () => {
   }
 });
 
+cron.schedule('0 2 * * *', async () => {
+      console.log(`🏠 [COLLECTION DATE CRON] Running daily MH/JP collection date sync at ${new Date().toISOString()}`);
+  try {
+    const result = await updateCollectionDatesFromDeTrack();
+    console.log(`✅ [COLLECTION DATE CRON] Daily sync completed. Updated ${result.updatedCount || 0} collection dates.`);
+    
+    if (result.updatedCount > 0) {
+      console.log(`📊 [COLLECTION DATE CRON] Sync summary: ${result.updatedCount} MH/JP orders updated with collection dates`);
+    } else {
+      console.log(`ℹ️ [COLLECTION DATE CRON] No MH/JP orders needed collection date updates`);
+    }
+  } catch (error) {
+    console.error('❌ [COLLECTION DATE CRON] Error in scheduled collection date sync:', error);
+  }
+});
+
+async function initializeCollectionDateSync() {
+  console.log(`🏠 [STARTUP] Running initial MH/JP collection date sync on server start`);
+  try {
+    const result = await updateCollectionDatesFromDeTrack();
+    console.log(`✅ [STARTUP] Initial MH/JP collection date sync completed. Updated ${result.updatedCount || 0} collection dates.`);
+  } catch (error) {
+    console.error('❌ [STARTUP] Error in initial MH/JP collection date sync:', error);
+  }
+}
 
 async function syncDeTrackStatuses() {
   try {
@@ -1471,6 +1499,236 @@ if (isAtWarehouse || hasWarehouseMilestone || hasWarehouseTimestamp) {
     };
   }
 }
+
+async function updateCollectionDatesFromDeTrack() {
+  try {
+    console.log("🏁 Starting collection date update for MH/JP orders from 2025-07-11");
+
+    // 1. Find all eligible orders - using string date comparison
+    const orders = await Order.find({
+      product: { $in: ['pharmacyjpmc', 'pharmacymoh'] },
+      doTrackingNumber: { $exists: true, $ne: null },
+      creationDate: { $gte: "2025-07-11" }, // Compare as string directly
+      $or: [
+        { collectionDate: { $exists: false } },
+        { collectionDate: null },
+        { collectionDate: "" }
+      ]
+    }).sort({ creationDate: 1 });
+
+    console.log(`📊 Found ${orders.length} MH/JP orders needing collection dates`);
+
+    let updatedCount = 0;
+    let apiCalls = 0;
+    let errors = 0;
+    
+    // 2. Process each order
+    for (const order of orders) {
+      try {
+        apiCalls++;
+        console.log(`🔍 Processing order ${order._id} with tracking ${order.doTrackingNumber}`);
+        
+        // Use the testSingleTrackingNumber logic
+        const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${order.doTrackingNumber}`, {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-KEY': process.env.DETRACK_API_KEY || 'Ude778d93ebd628e6c942a4c4f359643e9cefc1949b17d433'
+          },
+          timeout: 10000 // 10s timeout
+        });
+        
+        if (!response.ok) {
+          console.error(`❌ API error for ${order.doTrackingNumber}: ${response.status}`);
+          errors++;
+          continue;
+        }
+        
+        const responseData = await response.json();
+        const data = responseData.data || responseData; // Handle nested responses
+        
+        // 3. Extract all possible status indicators
+        const statusIndicators = [
+          data?.status,
+          data?.tracking_status,
+          ...(data?.milestones || []).map(m => m.status)
+        ].filter(Boolean);
+        
+        console.log(`🔍 Status indicators for ${order.doTrackingNumber}:`, statusIndicators);
+        
+        // 4. Check for warehouse/delivered status (expanded check)
+        const isAtWarehouse = statusIndicators.some(status => {
+          const normalizedStatus = String(status).toLowerCase();
+          return (
+            normalizedStatus.includes('warehouse') ||
+            normalizedStatus.includes('delivered') ||
+            normalizedStatus.includes('completed') ||
+            normalizedStatus.includes('collected') ||
+            normalizedStatus === 'at_warehouse' ||
+            normalizedStatus === 'out_for_delivery' ||
+            normalizedStatus === 'head_to_delivery'
+          );
+        });
+        
+        // 5. Get warehouse timestamp (from milestones if available)
+        const warehouseMilestone = (data?.milestones || []).find(m => 
+          String(m?.status).toLowerCase().includes('warehouse')
+        );
+        
+        const timestamp = warehouseMilestone?.pod_at || 
+                         data?.at_warehouse_at || 
+                         data?.completed_at || 
+                         new Date().toISOString();
+        
+        if (isAtWarehouse) {
+          // 6. Format collection date (UTC midnight)
+          const collectionDate = new Date(timestamp).toISOString().split('T')[0] + 'T00:00:00.000Z';
+          
+          // 7. Update the order
+          await Order.findByIdAndUpdate(
+            order._id,
+            { 
+              collectionDate: new Date(collectionDate),
+              collectionStatus: "collected",
+              collectionDateSource: "detrack_auto_sync",
+              updatedAt: new Date(),
+              detrackData: { // Store tracking info for reference
+                lastSync: new Date(),
+                status: statusIndicators[0],
+                sourceTimestamp: timestamp
+              }
+            },
+            { new: true }
+          );
+          
+          updatedCount++;
+          console.log(`✅ Updated ${order.doTrackingNumber} (${order.product}): ${collectionDate}`);
+        } else {
+          console.log(`ℹ️ ${order.doTrackingNumber} not at warehouse (Status: ${statusIndicators[0] || 'unknown'})`);
+        }
+        
+        // Rate limiting
+        await new Promise(resolve => setTimeout(resolve, 300));
+      } catch (error) {
+        errors++;
+        console.error(`❌ Failed to process ${order.doTrackingNumber}:`, error.message);
+      }
+    }
+    
+    // 8. Final report
+    console.log(`
+    🎉 Sync Completed
+    =================
+    Total Orders: ${orders.length}
+    API Calls: ${apiCalls}
+    Updated: ${updatedCount}
+    Errors: ${errors}
+    Success Rate: ${Math.round((updatedCount/orders.length)*100)}%
+    `);
+    
+    return { 
+      success: true, 
+      stats: {
+        totalOrders: orders.length,
+        updatedCount,
+        apiCalls,
+        errors
+      }
+    };
+    
+  } catch (error) {
+    console.error("💥 Critical sync error:", error);
+    return { 
+      success: false, 
+      error: error.message,
+      stack: error.stack 
+    };
+  }
+}
+
+// async function testSingleTrackingNumber(trackingNumber) {
+//   try {
+//     console.log(`🔍 Testing tracking number: ${trackingNumber}`);
+    
+//     // 1. Fetch DeTrack data
+//     const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${trackingNumber}`, {
+//       headers: {
+//         'Content-Type': 'application/json',
+//         'X-API-KEY': process.env.DETRACK_API_KEY
+//       }
+//     });
+    
+//     if (!response.ok) {
+//       throw new Error(`API Error: ${response.status}`);
+//     }
+    
+//     const responseData = await response.json();
+//     const data = responseData.data || responseData; // Handle nested responses
+//     console.log('📦 Raw milestones:', data.milestones);
+    
+//     // 2. Extract all possible status indicators
+//     const statusIndicators = [
+//       data.status,
+//       data.tracking_status,
+//       ...(data.milestones || []).map(m => m.status)
+//     ].filter(Boolean);
+    
+//     console.log('🔍 All status indicators:', statusIndicators);
+    
+//     // 3. Check for warehouse status (expanded check)
+//     const isAtWarehouse = statusIndicators.some(status => 
+//       String(status).toLowerCase().match(/warehouse|completed|delivered/i)
+//     );
+    
+//     // 4. Get warehouse timestamp (from milestones if available)
+//     const warehouseMilestone = (data.milestones || []).find(m => 
+//       m.status.toLowerCase().includes('warehouse')
+//     );
+    
+//     const timestamp = warehouseMilestone?.pod_at || 
+//                      data.completed_at || 
+//                      new Date().toISOString();
+    
+//     // 5. Format collection date (UTC midnight with +00:00 timezone)
+//     const collectionDate = new Date(timestamp).toISOString().split('T')[0] + 'T00:00:00.000+00:00';
+    
+//     console.log('\n✅ Final Decision:');
+//     console.log({
+//       trackingNumber,
+//       isAtWarehouse,
+//       collectionDate,
+//       sourceTimestamp: timestamp,
+//       matchedStatus: statusIndicators.find(s => String(s).match(/warehouse|completed|delivered/i))
+//     });
+    
+//     // 6. Update MongoDB if needed
+//     if (isAtWarehouse) {
+//       const updateResult = await Order.updateOne(
+//         { doTrackingNumber: trackingNumber },
+//         { 
+//           $set: { 
+//             collectionDate: new Date(collectionDate), // Convert to Date object for MongoDB
+//             collectionStatus: "collected",
+//             updatedAt: new Date(),
+//             detrackData: { // Store relevant tracking data
+//               lastStatus: statusIndicators[0],
+//               lastMilestone: data.milestones?.slice(-1)[0]?.status
+//             }
+//           } 
+//         }
+//       );
+//       console.log('📝 MongoDB update:', updateResult);
+//     }
+    
+//     return { success: true, isAtWarehouse, collectionDate };
+    
+//   } catch (error) {
+//     console.error(`❌ Failed to process ${trackingNumber}:`, error);
+//     return { success: false, error: error.message };
+//   }
+// }
+
+// // Run test
+// await testSingleTrackingNumber('GR200039072MH');
 
 app.get('/health', (req, res) => {
   res.status(200).json({ 
