@@ -248,7 +248,7 @@ app.get('/api/orders/search', async (req, res) => {
     // Search without date restrictions
     const orders = await Order.find(query)
       .sort({ creationDate: -1 })
-      .limit(100)
+      .limit(500)
       .lean(); // Use lean() for better performance
 
     console.log(`Found ${orders.length} matching orders`);
@@ -280,7 +280,7 @@ app.get('/api/orders/search', async (req, res) => {
       
       const caseInsensitiveResults = await Order.find(caseInsensitiveQuery)
         .sort({ creationDate: -1 })
-        .limit(100)
+        .limit(500)
         .lean();
         
       console.log(`Case-insensitive search found ${caseInsensitiveResults.length} orders`);
@@ -1317,7 +1317,7 @@ async function syncDeTrackStatuses() {
       doTrackingNumber: { $exists: true, $ne: null },
       collectionDate: { $exists: true, $ne: null },
       goRushStatus: { $ne: 'collected' }
-    }).limit(100);
+    }).limit(500);
     
     console.log(`🔄 Starting DeTrack sync for ${orders.length} orders`);
     
