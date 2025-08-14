@@ -318,7 +318,7 @@ app.post('/api/orders/reorder-webhook-only', async (req, res) => {
     } else if (jobMethod == "Express") {
       deliveryTypeCode = "EXP";
       startDate = moment().add(1, 'day').format('YYYY-MM-DD');
-    } else if (jobMethod == "Same Day" || jobMethod == "Immediate") {
+    } else if (jobMethod == "Immediate") {
       deliveryTypeCode = "IMM";
       startDate = moment().format('YYYY-MM-DD');
     }
