@@ -44,60 +44,38 @@ mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
     console.log("✅ MongoDB connected");
     // Run initial collection date sync
     await initializeCollectionDateSync();
-    // Create indexes with better error handling
+    // Create indexes
     await createIndexes();
-    await createDMSFormIndexes();
   })
   .catch(err => console.error("❌ MongoDB connection error:", err));
 
-async function createIndexes() {
+  async function createIndexes() {
   try {
     console.log("🔄 Creating MongoDB indexes...");
     
-    // First, drop existing indexes that might cause conflicts
-    try {
-      await Order.collection.dropIndexes();
-      console.log("✅ Dropped existing indexes from orders collection");
-    } catch (dropError) {
-      console.log("ℹ️ No indexes to drop or drop not permitted:", dropError.message);
-    }
-
-    async function createDMSFormIndexes() {
-  try {
-    await DMSForm.collection.createIndexes([
-      { key: { createdAt: -1, mohForm: 1 }, name: "idx_forms_created_moh" },
-      { key: { mohForm: 1, createdAt: -1 }, name: "idx_moh_created" },
-      { key: { updatedAt: -1 }, name: "idx_updated_at" }
-    ]);
-    console.log("✅ DMSForm indexes created");
-  } catch (error) {
-    console.log("ℹ️ DMSForm indexes may already exist:", error.message);
-  }
-}
-    
-    // Index for orders collection with explicit names
+    // Index for orders collection
     await Order.collection.createIndexes([
-      // Single field indexes with explicit names
-      { key: { product: 1 }, name: "idx_product" },
-      { key: { creationDate: -1 }, name: "idx_creation_date_desc" },
-      { key: { doTrackingNumber: 1 }, name: "idx_tracking_number" },
-      { key: { patientNumber: 1 }, name: "idx_patient_number" },
-      { key: { icPassNum: 1 }, name: "idx_ic_pass_num" },
-      { key: { passport: 1 }, name: "idx_passport" },
-      { key: { receiverPhoneNumber: 1 }, name: "idx_receiver_phone" },
-      { key: { collectionDate: 1 }, name: "idx_collection_date" },
-      { key: { goRushStatus: 1 }, name: "idx_gorush_status" },
-      { key: { pharmacyStatus: 1 }, name: "idx_pharmacy_status" },
-      { key: { currentStatus: 1 }, name: "idx_current_status" },
-      { key: { pharmacyFormCreated: 1 }, name: "idx_pharmacy_form_created" },
+      // Single field indexes
+      { key: { product: 1 } },
+      { key: { creationDate: -1 } },
+      { key: { doTrackingNumber: 1 } },
+      { key: { patientNumber: 1 } },
+      { key: { icPassNum: 1 } },
+      { key: { passport: 1 } },
+      { key: { receiverPhoneNumber: 1 } },
+      { key: { collectionDate: 1 } },
+      { key: { goRushStatus: 1 } },
+      { key: { pharmacyStatus: 1 } },
+      { key: { currentStatus: 1 } },
+      { key: { pharmacyFormCreated: 1 } },
       
       // Compound indexes for common queries
-      { key: { product: 1, creationDate: -1 }, name: "idx_product_creation_date" },
-      { key: { product: 1, goRushStatus: 1 }, name: "idx_product_gorush_status" },
-      { key: { product: 1, collectionDate: 1 }, name: "idx_product_collection_date" },
-      { key: { creationDate: -1, goRushStatus: 1 }, name: "idx_creation_date_gorush_status" },
-      { key: { doTrackingNumber: 1, product: 1 }, name: "idx_tracking_product" },
-      { key: { patientNumber: 1, creationDate: -1 }, name: "idx_patient_creation_date" },
+      { key: { product: 1, creationDate: -1 } },
+      { key: { product: 1, goRushStatus: 1 } },
+      { key: { product: 1, collectionDate: 1 } },
+      { key: { creationDate: -1, goRushStatus: 1 } },
+      { key: { doTrackingNumber: 1, product: 1 } },
+      { key: { patientNumber: 1, creationDate: -1 } },
       
       // Text indexes for search
       { 
@@ -111,90 +89,23 @@ async function createIndexes() {
           receiverPhoneNumber: 5,
           receiverAddress: 3
         },
-        name: "idx_text_search"
+        name: "text_search_index"
       }
     ]);
     
     // Index for DMS forms collection
     await DMSForm.collection.createIndexes([
-      { key: { createdAt: -1 }, name: "idx_forms_created_at" },
-      { key: { orderIds: 1 }, name: "idx_order_ids" },
-      { key: { mohForm: 1 }, name: "idx_moh_form" },
-      { key: { batchNo: 1 }, name: "idx_batch_no" },
-      { key: { formCreator: 1 }, name: "idx_form_creator" },
-      { key: { "previewData.meta.jobMethod": 1 }, name: "idx_job_method" }
+      { key: { createdAt: -1 } },
+      { key: { orderIds: 1 } },
+      { key: { mohForm: 1 } },
+      { key: { batchNo: 1 } },
+      { key: { formCreator: 1 } },
+      { key: { "previewData.meta.jobMethod": 1 } }
     ]);
     
     console.log("✅ MongoDB indexes created successfully");
-    
-    // Log index information
-    const orderIndexes = await Order.collection.indexes();
-    const formIndexes = await DMSForm.collection.indexes();
-    
-    console.log(`📊 Order collection indexes: ${orderIndexes.length}`);
-    console.log(`📊 DMSForm collection indexes: ${formIndexes.length}`);
-    
   } catch (error) {
-    console.error("❌ Error creating indexes:", error.message);
-    
-    // If dropping indexes fails, try creating with different approach
-    if (error.code === 86 || error.codeName === 'IndexKeySpecsConflict') {
-      console.log("🔄 Trying alternative index creation approach...");
-      await createIndexesAlternative();
-    }
-  }
-}
-
-async function createIndexesAlternative() {
-  try {
-    // Create indexes one by one with error handling
-    const orderIndexes = [
-      { key: { product: 1 }, name: "idx_product" },
-      { key: { creationDate: -1 }, name: "idx_creation_date_desc" },
-      { key: { doTrackingNumber: 1 }, name: "idx_tracking_number" },
-      { key: { patientNumber: 1 }, name: "idx_patient_number" },
-      { key: { icPassNum: 1 }, name: "idx_ic_pass_num" },
-      { key: { passport: 1 }, name: "idx_passport" },
-      { key: { receiverPhoneNumber: 1 }, name: "idx_receiver_phone" },
-      { key: { collectionDate: 1 }, name: "idx_collection_date" },
-      { key: { goRushStatus: 1 }, name: "idx_gorush_status" },
-      { key: { pharmacyStatus: 1 }, name: "idx_pharmacy_status" },
-      { key: { currentStatus: 1 }, name: "idx_current_status" },
-      { key: { pharmacyFormCreated: 1 }, name: "idx_pharmacy_form_created" },
-    ];
-    
-    for (const indexSpec of orderIndexes) {
-      try {
-        await Order.collection.createIndex(indexSpec.key, { name: indexSpec.name });
-        console.log(`✅ Created index: ${indexSpec.name}`);
-      } catch (indexError) {
-        console.log(`ℹ️ Index ${indexSpec.name} may already exist: ${indexError.message}`);
-      }
-    }
-    
-    // Create compound indexes
-    const compoundIndexes = [
-      { key: { product: 1, creationDate: -1 }, name: "idx_product_creation_date" },
-      { key: { product: 1, goRushStatus: 1 }, name: "idx_product_gorush_status" },
-      { key: { product: 1, collectionDate: 1 }, name: "idx_product_collection_date" },
-      { key: { creationDate: -1, goRushStatus: 1 }, name: "idx_creation_date_gorush_status" },
-      { key: { doTrackingNumber: 1, product: 1 }, name: "idx_tracking_product" },
-      { key: { patientNumber: 1, creationDate: -1 }, name: "idx_patient_creation_date" },
-    ];
-    
-    for (const indexSpec of compoundIndexes) {
-      try {
-        await Order.collection.createIndex(indexSpec.key, { name: indexSpec.name });
-        console.log(`✅ Created compound index: ${indexSpec.name}`);
-      } catch (indexError) {
-        console.log(`ℹ️ Compound index ${indexSpec.name} may already exist: ${indexError.message}`);
-      }
-    }
-    
-    console.log("✅ Alternative index creation completed");
-    
-  } catch (error) {
-    console.error("❌ Alternative index creation failed:", error.message);
+    console.error("❌ Error creating indexes:", error);
   }
 }
 
@@ -2072,38 +1983,29 @@ app.get('/api/gr_dms/forms', async (req, res) => {
       return res.json(cachedData);
     }
 
-    // Use lean() for better performance and only select needed fields
     const forms = await DMSForm.find({
+      // Filter MOH forms created on or after 30th July 2025
       $or: [
         { 
-          mohForm: { $exists: true, $ne: null },
-          createdAt: { $gte: new Date('2025-08-06') }
+          mohForm: { $exists: true, $ne: null }, // MOH forms
+          createdAt: { $gte: new Date('2025-08-06') } // From 30th July
         },
         { 
-          mohForm: { $exists: false }
+          mohForm: { $exists: false }, // Non-MOH forms (no date restriction)
         }
       ]
     })
-    .select('formName formDate batchNo mohForm numberOfForms createdAt updatedAt')
-    .sort({ createdAt: -1 })
-    .lean() // Convert to plain JavaScript objects
-    .maxTimeMS(2000); // Timeout after 2 seconds
-
+    .select('formName formDate batchNo mohForm numberOfForms createdAt')
+    .sort({ createdAt: -1 });
+    
     const result = { success: true, forms };
     cache.set(cacheKey, result);
     res.json(result);
   } catch (error) {
     console.error('Error fetching forms:', error);
-    
-    // If timeout error, return empty result instead of error
-    if (error.name === 'MongoServerError' && error.code === 50) {
-      res.json({ success: true, forms: [], message: 'Query timeout, returning empty result' });
-    } else {
-      res.status(500).json({ success: false, error: 'Internal server error' });
-    }
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
-
 
 app.get('/api/gr_dms/forms/by-order/:orderId', async (req, res) => {
   try {
