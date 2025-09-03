@@ -8,10 +8,14 @@ import cron from 'node-cron';
 import dayjs from 'dayjs';
 import axios from 'axios';
 import moment from 'moment';
+import NodeCache from 'node-cache';
 
 dotenv.config();
 
 const app = express();
+
+// Initialize cache with 60-second TTL
+const cache = new NodeCache({ stdTTL: 60, checkperiod: 120 });
 
 // Enhanced CORS configuration
 const corsOptions = {
@@ -42,6 +46,7 @@ mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
     await initializeCollectionDateSync();
   })
   .catch(err => console.error("❌ MongoDB connection error:", err));
+
 // Define schema + model
 const orderSchema = new mongoose.Schema({
   product: { type: String, enum: ['pharmacyjpmc', 'pharmacymoh'], index: true},
@@ -91,7 +96,6 @@ const dmsFormSchema = new mongoose.Schema({
 
 const DMSForm = mongoose.model('DMSForm', dmsFormSchema);
 
-
 const getDateFilter = () => {
   return {
     $or: [
@@ -119,6 +123,21 @@ const getDateFilter = () => {
   };
 };
 
+// Helper function to generate cache keys
+const generateCacheKey = (prefix, params) => {
+  return `${prefix}_${JSON.stringify(params)}`;
+};
+
+// Clear cache for specific patterns
+const clearCachePattern = (pattern) => {
+  const keys = cache.keys();
+  keys.forEach(key => {
+    if (key.startsWith(pattern)) {
+      cache.del(key);
+    }
+  });
+};
+
 // Add this to your server.js
 app.put('/api/orders/:id/payment', async (req, res) => {
   try {
@@ -139,6 +158,9 @@ app.put('/api/orders/:id/payment', async (req, res) => {
       { paymentAmount },
       { new: true }
     );
+
+    // Clear orders cache since we updated an order
+    clearCachePattern('orders_');
 
     // If we have a tracking number, update DeTrack
     if (doTrackingNumber) {
@@ -197,7 +219,6 @@ app.put('/api/orders/:id/payment', async (req, res) => {
     });
   }
 });
-
 
 app.get('/api/orders/search', async (req, res) => {
   try {
@@ -533,6 +554,9 @@ app.put('/api/detrack/:trackingNumber/cancel', async (req, res) => {
       { new: true, runValidators: false } // Skip validation to avoid enum errors
     );
 
+    // Clear orders cache since we updated an order
+    clearCachePattern('orders_');
+
     // Add a log entry for this cancellation
     const logEntry = {
       note: detrackError 
@@ -728,6 +752,14 @@ app.get('/api/orders/logs', async (req, res) => {
 
 app.get('/api/gr_dms/saved-orders', async (req, res) => {
   try {
+    const cacheKey = generateCacheKey('saved_orders', {});
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached saved orders data');
+      return res.json(cachedData);
+    }
+
     const savedOrders = await DMSForm.aggregate([
       { $unwind: "$orderIds" },
       { $group: { _id: null, orderIds: { $addToSet: "$orderIds" } } }
@@ -735,10 +767,13 @@ app.get('/api/gr_dms/saved-orders', async (req, res) => {
     
     const orderIds = savedOrders.length > 0 ? savedOrders[0].orderIds : [];
     
-    res.json({ 
+    const result = { 
       success: true,
       orderIds 
-    });
+    };
+    
+    cache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
     console.error('Error fetching saved orders:', error);
     res.status(500).json({ 
@@ -760,6 +795,14 @@ app.use('/api/auth', authRoutes);
 
 app.get('/api/orders', async (req, res) => {
   try {
+    const cacheKey = generateCacheKey('orders', { role: req.userRole });
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached orders data');
+      return res.json(cachedData);
+    }
+
     const combinedFilter = getCombinedFilter(req.userRole);
     const queryOptions = getQueryOptions(req.userRole);
 
@@ -775,6 +818,7 @@ app.get('/api/orders', async (req, res) => {
       isSaved: savedOrders.includes(order._id.toString())
     }));
 
+    cache.set(cacheKey, ordersWithStatus);
     res.json(ordersWithStatus);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -783,6 +827,14 @@ app.get('/api/orders', async (req, res) => {
 
 app.get('/api/customers', async (req, res) => {
   try {
+    const cacheKey = generateCacheKey('customers', { role: req.userRole });
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached customers data');
+      return res.json(cachedData);
+    }
+
     const combinedFilter = getCombinedFilter(req.userRole);
     
     let aggregationPipeline = [
@@ -814,6 +866,7 @@ app.get('/api/customers', async (req, res) => {
     
     const customers = await Order.aggregate(aggregationPipeline);
     
+    cache.set(cacheKey, customers);
     res.json(customers);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -823,6 +876,18 @@ app.get('/api/customers', async (req, res) => {
 app.get('/api/customers/:patientNumber/orders', async (req, res) => {
   try {
     const { patientNumber } = req.params;
+    const cacheKey = generateCacheKey('customer_orders', { 
+      role: req.userRole, 
+      patientNumber 
+    });
+    
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached customer orders data');
+      return res.json(cachedData);
+    }
+
     const combinedFilter = getCombinedFilter(req.userRole);
     
     let query = Order.find({ 
@@ -832,12 +897,12 @@ app.get('/api/customers/:patientNumber/orders', async (req, res) => {
     
     const orders = await query;
     
+    cache.set(cacheKey, orders);
     res.json(orders);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
-
 
 app.put('/api/orders/:id/collection-date', async (req, res) => {
   try {
@@ -884,6 +949,11 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
       { new: true }
     );
 
+    // Clear relevant caches
+    clearCachePattern('orders_');
+    clearCachePattern('customers_');
+    clearCachePattern('collection_dates_');
+
     // Return formatted date in response
     const responseData = updatedOrder.toObject();
     responseData.formattedCollectionDate = updatedOrder.collectionDate ? 
@@ -903,6 +973,14 @@ app.put('/api/orders/:id/collection-date', async (req, res) => {
 
 app.get('/api/collection-dates', async (req, res) => {
   try {
+    const cacheKey = generateCacheKey('collection_dates', {});
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached collection dates data');
+      return res.json(cachedData);
+    }
+
     const july2025 = new Date('2025-08-07T00:00:00Z');
     
     const dates = await Order.aggregate([
@@ -934,10 +1012,13 @@ app.get('/api/collection-dates', async (req, res) => {
       { $sort: { _id: 1 } }
     ]);
 
-    res.json(dates.map(d => ({
+    const result = dates.map(d => ({
       dateString: d._id,
       count: d.count
-    })));
+    }));
+
+    cache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
     console.error('Error fetching collection dates:', error);
     res.status(500).json({ error: error.message });
@@ -949,6 +1030,18 @@ app.get('/api/orders/collection-dates', async (req, res) => {
     const { date } = req.query;
     if (!date) {
       return res.status(400).json({ error: 'Date parameter is required' });
+    }
+
+    const cacheKey = generateCacheKey('orders_by_date', { 
+      role: req.userRole, 
+      date 
+    });
+    
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached orders by date data');
+      return res.json(cachedData);
     }
 
     // Create start and end of day in UTC
@@ -968,6 +1061,7 @@ app.get('/api/orders/collection-dates', async (req, res) => {
       ...combinedFilter
     }).sort({ collectionDate: 1 });
 
+    cache.set(cacheKey, orders);
     res.json(orders);
   } catch (error) {
     console.error('Error fetching orders for date:', error);
@@ -984,6 +1078,14 @@ app.get('/api/orders/:id', async (req, res) => {
       return res.status(400).json({ error: 'Invalid order ID' });
     }
 
+    const cacheKey = generateCacheKey('order', { id });
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached order data');
+      return res.json(cachedData);
+    }
+
     // First find the order without product filter
     const order = await Order.findById(id);
     
@@ -996,13 +1098,13 @@ app.get('/api/orders/:id', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    cache.set(cacheKey, order);
     res.json(order);
   } catch (error) {
     console.error('Error fetching order:', error);
     res.status(500).json({ error: error.message });
   }
 });
-
 
 // Updated DeTrack endpoint with comprehensive debugging and auto status update
 app.get('/api/detrack/:trackingNumber', async (req, res) => {
@@ -1036,67 +1138,22 @@ app.get('/api/detrack/:trackingNumber', async (req, res) => {
     console.log(`🔍 Checking status: ${data.status} (type: ${typeof data.status})`);
     console.log(`🔍 Checking tracking_status: ${data.tracking_status} (type: ${typeof data.tracking_status})`);
     
-// In your /api/detrack/:trackingNumber endpoint
-if (data && data.status && data.status === 'at_warehouse') {
-  console.log(`✅ Status is 'at_warehouse', proceeding with order update`);
-  
-  try {
-    // Find order by tracking number
-    const order = await Order.findOne({
-      doTrackingNumber: trackingNumber
-    });
-    
-    if (order) {
-      if (order.goRushStatus === 'collected') {
-        console.log(`ℹ️ Order already marked as collected, skipping update`);
-        data.orderUpdated = false;
-        data.message = 'Order already marked as collected';
-      } else {
-        // Update Go Rush status to "collected" WITHOUT adding a log
-        const updatedOrder = await Order.findByIdAndUpdate(
-          order._id,
-          { 
-            goRushStatus: 'collected',
-            updatedAt: new Date()
-          },
-          { new: true, runValidators: false }
-        );
-        
-        console.log(`✅ Updated Go Rush status to 'collected' for order: ${order._id}`);
-        
-        data.orderUpdated = true;
-        data.updatedGoRushStatus = 'collected';
-        data.orderId = order._id;
-      }
-    }
-  } catch (updateError) {
-    console.error('❌ Error updating order status:', updateError);
-    data.orderUpdated = false;
-    data.updateError = updateError.message;
-  }
-
+    if (data && data.status && data.status === 'at_warehouse') {
       console.log(`✅ Status is 'at_warehouse', proceeding with order update`);
       
       try {
         // Find order by tracking number
-        console.log(`🔍 Searching for order with doTrackingNumber: ${trackingNumber}`);
-        
         const order = await Order.findOne({
           doTrackingNumber: trackingNumber
         });
         
-        console.log(`🔍 Order search result:`, order ? `Found order ID: ${order._id}` : 'No order found');
-        
         if (order) {
-          console.log(`📝 Current order status - goRushStatus: ${order.goRushStatus}, pharmacyStatus: ${order.pharmacyStatus}`);
-          
-          // Check if already collected to avoid unnecessary updates
           if (order.goRushStatus === 'collected') {
             console.log(`ℹ️ Order already marked as collected, skipping update`);
             data.orderUpdated = false;
             data.message = 'Order already marked as collected';
           } else {
-            // Update Go Rush status to "collected"
+            // Update Go Rush status to "collected" WITHOUT adding a log
             const updatedOrder = await Order.findByIdAndUpdate(
               order._id,
               { 
@@ -1108,39 +1165,13 @@ if (data && data.status && data.status === 'at_warehouse') {
             
             console.log(`✅ Updated Go Rush status to 'collected' for order: ${order._id}`);
             
-            // Add a log entry for this automatic update
-            const logEntry = {
-              note: `Status automatically updated to 'collected' based on DeTrack status: ${data.tracking_status || data.status}`,
-              category: 'system',
-              createdBy: 'system',
-              createdAt: new Date(),
-            };
+            // Clear orders cache since we updated an order
+            clearCachePattern('orders_');
             
-            updatedOrder.logs.push(logEntry);
-            await updatedOrder.save();
-            
-            console.log(`📝 Added system log entry for automatic status update`);
-            
-            // Include the updated order info in the response
             data.orderUpdated = true;
             data.updatedGoRushStatus = 'collected';
             data.orderId = order._id;
           }
-        } else {
-          console.log(`⚠️ No order found with tracking number: ${trackingNumber}`);
-          
-          // Debug: Let's see what doTrackingNumbers exist in the database
-          const allTrackingNumbers = await Order.aggregate([
-            { $match: { doTrackingNumber: { $exists: true, $ne: null } } },
-            { $project: { doTrackingNumber: 1, _id: 1 } },
-            { $limit: 10 }
-          ]);
-          
-          console.log(`🔍 Sample doTrackingNumbers in database:`, allTrackingNumbers);
-          
-          data.orderUpdated = false;
-          data.message = 'No order found with this tracking number';
-          data.searchedTrackingNumber = trackingNumber;
         }
       } catch (updateError) {
         console.error('❌ Error updating order status:', updateError);
@@ -1163,7 +1194,6 @@ if (data && data.status && data.status === 'at_warehouse') {
     });
   }
 });
-
 
 // Alternative: Create a separate endpoint for bulk tracking updates
 app.post('/api/detrack/bulk-update', async (req, res) => {
@@ -1204,6 +1234,9 @@ app.post('/api/detrack/bulk-update', async (req, res) => {
                 },
                 { new: true, runValidators: false }
               );
+              
+              // Clear orders cache since we updated an order
+              clearCachePattern('orders_');
               
               // Add log entry
               const logEntry = {
@@ -1351,45 +1384,42 @@ async function syncDeTrackStatuses() {
           milestones: data?.milestones?.map(m => m.status)
         });
         
-const statusIndicators = [
-  data?.status,
-  data?.tracking_status,
-  data?.primary_job_status,
-  ...(data?.milestones || []).map(m => m.status)
-].filter(Boolean);
+        const statusIndicators = [
+          data?.status,
+          data?.tracking_status,
+          data?.primary_job_status,
+          ...(data?.milestones || []).map(m => m.status)
+        ].filter(Boolean);
 
-console.log(`🔍 Status indicators found:`, statusIndicators);
-        
         console.log(`🔍 Status indicators found:`, statusIndicators);
         
-const isAtWarehouse = statusIndicators.some(status => {
-  const normalizedStatus = String(status).toLowerCase();
-  return (
-    normalizedStatus.includes('warehouse') ||
-    normalizedStatus.includes('delivered') ||
-    normalizedStatus.includes('completed') ||
-    normalizedStatus.includes('collected') ||
-    normalizedStatus === 'at_warehouse' ||
-    normalizedStatus === 'out_for_delivery' ||
-    normalizedStatus === 'head_to_delivery'
-  );
-});
+        const isAtWarehouse = statusIndicators.some(status => {
+          const normalizedStatus = String(status).toLowerCase();
+          return (
+            normalizedStatus.includes('warehouse') ||
+            normalizedStatus.includes('delivered') ||
+            normalizedStatus.includes('completed') ||
+            normalizedStatus.includes('collected') ||
+            normalizedStatus === 'at_warehouse' ||
+            normalizedStatus === 'out_for_delivery' ||
+            normalizedStatus === 'head_to_delivery'
+          );
+        });
 
-const hasWarehouseMilestone = data?.milestones && data.milestones.includes('at_warehouse');
-
+        const hasWarehouseMilestone = data?.milestones && data.milestones.includes('at_warehouse');
         
-const hasWarehouseTimestamp = data?.at_warehouse_at !== null && data?.at_warehouse_at !== undefined;
+        const hasWarehouseTimestamp = data?.at_warehouse_at !== null && data?.at_warehouse_at !== undefined;
 
-console.log(`🔍 Warehouse checks:`, {
-  isAtWarehouse,
-  hasWarehouseMilestone, 
-  hasWarehouseTimestamp,
-  atWarehouseTimestamp: data?.at_warehouse_at
-});
+        console.log(`🔍 Warehouse checks:`, {
+          isAtWarehouse,
+          hasWarehouseMilestone, 
+          hasWarehouseTimestamp,
+          atWarehouseTimestamp: data?.at_warehouse_at
+        });
         
-if (isAtWarehouse || hasWarehouseMilestone || hasWarehouseTimestamp) {
-  statusMatches++;
-  console.log(`✅ Found confirmed warehouse/delivered status for ${order.doTrackingNumber}`);
+        if (isAtWarehouse || hasWarehouseMilestone || hasWarehouseTimestamp) {
+          statusMatches++;
+          console.log(`✅ Found confirmed warehouse/delivered status for ${order.doTrackingNumber}`);
           
           // Update order status
           const updateData = {
@@ -1413,6 +1443,9 @@ if (isAtWarehouse || hasWarehouseMilestone || hasWarehouseTimestamp) {
             updateData,
             { new: true, runValidators: false }
           );      
+          
+          // Clear orders cache since we updated an order
+          clearCachePattern('orders_');
           
           updatedCount++;
           console.log(`✅ Updated order ${order._id} to collected`);
@@ -1550,6 +1583,11 @@ async function updateCollectionDatesFromDeTrack() {
             { new: true }
           );
           
+          // Clear relevant caches
+          clearCachePattern('orders_');
+          clearCachePattern('customers_');
+          clearCachePattern('collection_dates_');
+          
           updatedCount++;
           console.log(`✅ Updated ${order.doTrackingNumber} (${order.product}): ${collectionDate}`);
         } else {
@@ -1594,91 +1632,6 @@ async function updateCollectionDatesFromDeTrack() {
     };
   }
 }
-
-// async function testSingleTrackingNumber(trackingNumber) {
-//   try {
-//     console.log(`🔍 Testing tracking number: ${trackingNumber}`);
-    
-//     // 1. Fetch DeTrack data
-//     const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${trackingNumber}`, {
-//       headers: {
-//         'Content-Type': 'application/json',
-//         'X-API-KEY': process.env.DETRACK_API_KEY
-//       }
-//     });
-    
-//     if (!response.ok) {
-//       throw new Error(`API Error: ${response.status}`);
-//     }
-    
-//     const responseData = await response.json();
-//     const data = responseData.data || responseData; // Handle nested responses
-//     console.log('📦 Raw milestones:', data.milestones);
-    
-//     // 2. Extract all possible status indicators
-//     const statusIndicators = [
-//       data.status,
-//       data.tracking_status,
-//       ...(data.milestones || []).map(m => m.status)
-//     ].filter(Boolean);
-    
-//     console.log('🔍 All status indicators:', statusIndicators);
-    
-//     // 3. Check for warehouse status (expanded check)
-//     const isAtWarehouse = statusIndicators.some(status => 
-//       String(status).toLowerCase().match(/warehouse|completed|delivered/i)
-//     );
-    
-//     // 4. Get warehouse timestamp (from milestones if available)
-//     const warehouseMilestone = (data.milestones || []).find(m => 
-//       m.status.toLowerCase().includes('warehouse')
-//     );
-    
-//     const timestamp = warehouseMilestone?.pod_at || 
-//                      data.completed_at || 
-//                      new Date().toISOString();
-    
-//     // 5. Format collection date (UTC midnight with +00:00 timezone)
-//     const collectionDate = new Date(timestamp).toISOString().split('T')[0] + 'T00:00:00.000+00:00';
-    
-//     console.log('\n✅ Final Decision:');
-//     console.log({
-//       trackingNumber,
-//       isAtWarehouse,
-//       collectionDate,
-//       sourceTimestamp: timestamp,
-//       matchedStatus: statusIndicators.find(s => String(s).match(/warehouse|completed|delivered/i))
-//     });
-    
-//     // 6. Update MongoDB if needed
-//     if (isAtWarehouse) {
-//       const updateResult = await Order.updateOne(
-//         { doTrackingNumber: trackingNumber },
-//         { 
-//           $set: { 
-//             collectionDate: new Date(collectionDate), // Convert to Date object for MongoDB
-//             collectionStatus: "collected",
-//             updatedAt: new Date(),
-//             detrackData: { // Store relevant tracking data
-//               lastStatus: statusIndicators[0],
-//               lastMilestone: data.milestones?.slice(-1)[0]?.status
-//             }
-//           } 
-//         }
-//       );
-//       console.log('📝 MongoDB update:', updateResult);
-//     }
-    
-//     return { success: true, isAtWarehouse, collectionDate };
-    
-//   } catch (error) {
-//     console.error(`❌ Failed to process ${trackingNumber}:`, error);
-//     return { success: false, error: error.message };
-//   }
-// }
-
-// // Run test
-// await testSingleTrackingNumber('GR200039072MH');
 
 app.get('/health', (req, res) => {
   res.status(200).json({ 
@@ -1732,6 +1685,9 @@ app.put('/api/orders/:id/go-rush-status', async (req, res) => {
       { new: true, runValidators: false }
     );
 
+    // Clear orders cache since we updated an order
+    clearCachePattern('orders_');
+
     res.json(updatedOrder);
 
   } catch (error) {
@@ -1780,6 +1736,9 @@ app.put('/api/orders/:id/pharmacy-status', async (req, res) => {
       { new: true, runValidators: false }
     );
 
+    // Clear orders cache since we updated an order
+    clearCachePattern('orders_');
+
     res.json(updatedOrder);
 
   } catch (error) {
@@ -1822,6 +1781,9 @@ app.put('/api/orders/:id/status', async (req, res) => {
       { new: true, runValidators: false }
     );
 
+    // Clear orders cache since we updated an order
+    clearCachePattern('orders_');
+
     res.json(updatedOrder);
 
   } catch (error) {
@@ -1861,6 +1823,9 @@ app.post('/api/orders/:id/logs', async (req, res) => {
     order.logs.push(logEntry);
     await order.save();
 
+    // Clear orders cache since we updated an order
+    clearCachePattern('orders_');
+
     res.status(201).json({ message: 'Log added successfully', log: logEntry });
   } catch (err) {
     console.error(err);
@@ -1898,6 +1863,9 @@ app.post('/api/orders/:id/pharmacy-remarks', async (req, res) => {
     order.pharmacyRemarks.push(entry);
     await order.save();
 
+    // Clear orders cache since we updated an order
+    clearCachePattern('orders_');
+
     res.status(201).json({ message: 'Remark added', remark: entry });
   } catch (err) {
     console.error(err);
@@ -1905,11 +1873,17 @@ app.post('/api/orders/:id/pharmacy-remarks', async (req, res) => {
   }
 });
 
-
-
 // In your backend (server.js or routes file)
 app.get('/api/gr_dms/forms', async (req, res) => {
   try {
+    const cacheKey = generateCacheKey('dms_forms', {});
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached DMS forms data');
+      return res.json(cachedData);
+    }
+
     const forms = await DMSForm.find({
       // Filter MOH forms created on or after 30th July 2025
       $or: [
@@ -1925,7 +1899,9 @@ app.get('/api/gr_dms/forms', async (req, res) => {
     .select('formName formDate batchNo mohForm numberOfForms createdAt')
     .sort({ createdAt: -1 });
     
-    res.json({ success: true, forms });
+    const result = { success: true, forms };
+    cache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
     console.error('Error fetching forms:', error);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1935,6 +1911,14 @@ app.get('/api/gr_dms/forms', async (req, res) => {
 app.get('/api/gr_dms/forms/by-order/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
+    const cacheKey = generateCacheKey('dms_form_by_order', { orderId });
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached DMS form by order data');
+      return res.json(cachedData);
+    }
+
     console.log('API: Looking for orderId:', orderId);
     
     // Find form that contains this orderId in the orderIds array
@@ -1954,10 +1938,13 @@ app.get('/api/gr_dms/forms/by-order/:orderId', async (req, res) => {
 
     console.log('API: Returning form with rows:', form.previewData?.rows?.length || 0);
 
-    res.json({
+    const result = {
       success: true,
       form: form
-    });
+    };
+    
+    cache.set(cacheKey, result);
+    res.json(result);
   } catch (error) {
     console.error('API Error:', error);
     res.status(500).json({
@@ -1971,6 +1958,13 @@ app.get('/api/gr_dms/forms/by-order/:orderId', async (req, res) => {
 app.get('/api/gr_dms/forms/:formId', async (req, res) => {
   try {
     const { formId } = req.params;
+    const cacheKey = generateCacheKey('dms_form', { formId });
+    const cachedData = cache.get(cacheKey);
+    
+    if (cachedData) {
+      console.log('📦 Returning cached DMS form data');
+      return res.json(cachedData);
+    }
     
     const form = await DMSForm.findById(formId);
     
@@ -1981,11 +1975,14 @@ app.get('/api/gr_dms/forms/:formId', async (req, res) => {
       });
     }
     
-    res.json({
+    const result = {
       success: true,
       form: form,
       previewData: form.previewData
-    });
+    };
+    
+    cache.set(cacheKey, result);
+    res.json(result);
     
   } catch (error) {
     console.error('Error fetching form:', error);
@@ -1996,9 +1993,6 @@ app.get('/api/gr_dms/forms/:formId', async (req, res) => {
     });
   }
 });
-
-
-
 
 // Fixed POST endpoint for saving forms with order updates
 app.post('/api/gr_dms/forms', async (req, res) => {
@@ -2064,6 +2058,10 @@ app.post('/api/gr_dms/forms', async (req, res) => {
     // Save the form first
     const savedForm = await newForm.save();
     
+    // Clear DMS forms cache since we added a new form
+    clearCachePattern('dms_forms');
+    clearCachePattern('saved_orders');
+    
     // Extract tracking numbers from the form data
     const trackingNumbers = completePreviewData.rows
       .map(row => row.trackingNumber || row.rawData?.doTrackingNumber || row.doTrackingNumber)
@@ -2085,6 +2083,9 @@ app.post('/api/gr_dms/forms', async (req, res) => {
       );
       
       console.log(`Updated ${updateResult.modifiedCount} orders with pharmacyFormCreated = 'yes'`);
+      
+      // Clear orders cache since we updated orders
+      clearCachePattern('orders_');
       
       // Log any tracking numbers that weren't found
       if (updateResult.modifiedCount < trackingNumbers.length) {
