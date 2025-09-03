@@ -15,7 +15,7 @@ dotenv.config();
 const app = express();
 
 // Initialize cache with 60-second TTL
-const cache = new NodeCache({ stdTTL: 60, checkperiod: 120 });
+const cache = new NodeCache({ stdTTL: 7200, checkperiod: 600 });
 
 // Enhanced CORS configuration
 const corsOptions = {
