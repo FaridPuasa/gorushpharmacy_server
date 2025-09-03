@@ -44,8 +44,104 @@ mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
     console.log("✅ MongoDB connected");
     // Run initial collection date sync
     await initializeCollectionDateSync();
+    // Create indexes
+    await createIndexes();
   })
   .catch(err => console.error("❌ MongoDB connection error:", err));
+
+  async function createIndexes() {
+  try {
+    console.log("🔄 Creating MongoDB indexes...");
+    
+    // Index for orders collection
+    await Order.collection.createIndexes([
+      // Single field indexes
+      { key: { product: 1 } },
+      { key: { creationDate: -1 } },
+      { key: { doTrackingNumber: 1 } },
+      { key: { patientNumber: 1 } },
+      { key: { icPassNum: 1 } },
+      { key: { passport: 1 } },
+      { key: { receiverPhoneNumber: 1 } },
+      { key: { collectionDate: 1 } },
+      { key: { goRushStatus: 1 } },
+      { key: { pharmacyStatus: 1 } },
+      { key: { currentStatus: 1 } },
+      { key: { pharmacyFormCreated: 1 } },
+      
+      // Compound indexes for common queries
+      { key: { product: 1, creationDate: -1 } },
+      { key: { product: 1, goRushStatus: 1 } },
+      { key: { product: 1, collectionDate: 1 } },
+      { key: { creationDate: -1, goRushStatus: 1 } },
+      { key: { doTrackingNumber: 1, product: 1 } },
+      { key: { patientNumber: 1, creationDate: -1 } },
+      
+      // Text indexes for search
+      { 
+        key: { 
+          receiverName: "text", 
+          receiverAddress: "text",
+          receiverPhoneNumber: "text"
+        },
+        weights: {
+          receiverName: 10,
+          receiverPhoneNumber: 5,
+          receiverAddress: 3
+        },
+        name: "text_search_index"
+      }
+    ]);
+    
+    // Index for DMS forms collection
+    await DMSForm.collection.createIndexes([
+      { key: { createdAt: -1 } },
+      { key: { orderIds: 1 } },
+      { key: { mohForm: 1 } },
+      { key: { batchNo: 1 } },
+      { key: { formCreator: 1 } },
+      { key: { "previewData.meta.jobMethod": 1 } }
+    ]);
+    
+    console.log("✅ MongoDB indexes created successfully");
+  } catch (error) {
+    console.error("❌ Error creating indexes:", error);
+  }
+}
+
+async function getIndexStats() {
+  try {
+    const orderIndexes = await Order.collection.indexes();
+    const formIndexes = await DMSForm.collection.indexes();
+    
+    console.log("📊 Order collection indexes:", orderIndexes.length);
+    console.log("📊 DMSForm collection indexes:", formIndexes.length);
+    
+    return { orderIndexes, formIndexes };
+  } catch (error) {
+    console.error("Error getting index stats:", error);
+    return null;
+  }
+}
+
+async function checkIndexUsage() {
+  try {
+    // Get index usage stats (requires MongoDB 4.4+)
+    const indexStats = await Order.collection.aggregate([
+      { $indexStats: {} }
+    ]).toArray();
+    
+    console.log("📈 Index usage statistics:");
+    indexStats.forEach(stat => {
+      console.log(`- ${stat.name}: ${stat.accesses.ops} operations`);
+    });
+    
+    return indexStats;
+  } catch (error) {
+    console.log("Index stats not available (MongoDB < 4.4)");
+    return null;
+  }
+}
 
 // Define schema + model
 const orderSchema = new mongoose.Schema({
@@ -138,6 +234,33 @@ const clearCachePattern = (pattern) => {
   });
 };
 
+app.get('/api/admin/indexes', async (req, res) => {
+  try {
+    const stats = await getIndexStats();
+    res.json({ success: true, stats });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/admin/index-usage', async (req, res) => {
+  try {
+    const usage = await checkIndexUsage();
+    res.json({ success: true, usage });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/admin/reindex', async (req, res) => {
+  try {
+    await createIndexes();
+    res.json({ success: true, message: 'Indexes recreated successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Add this to your server.js
 app.put('/api/orders/:id/payment', async (req, res) => {
   try {
@@ -225,93 +348,51 @@ app.get('/api/orders/search', async (req, res) => {
     console.log('=== SEARCH REQUEST ===');
     console.log('Raw query params:', req.query);
     
-    // Extract the search parameters directly from query
-    const { patientNumber, icPassNum, receiverPhoneNumber } = req.query;
+    // Extract the search parameters
+    const { patientNumber, icPassNum, receiverPhoneNumber, text } = req.query;
     
-    // Determine which field was provided
-    let field, value;
-    if (patientNumber) {
-      field = 'patientNumber';
-      value = patientNumber;
+    let query = {};
+    
+    // Text search using index
+    if (text) {
+      query.$text = { $search: text };
+      console.log(`Using text search for: "${text}"`);
+    } 
+    // Specific field searches
+    else if (patientNumber) {
+      query.patientNumber = patientNumber;
     } else if (icPassNum) {
-      field = 'icPassNum';
-      value = icPassNum;
+      query.$or = [
+        { icPassNum: { $regex: new RegExp(`^${icPassNum}$`, 'i') } },
+        { passport: { $regex: new RegExp(`^${icPassNum}$`, 'i') } }
+      ];
     } else if (receiverPhoneNumber) {
-      field = 'receiverPhoneNumber';
-      value = receiverPhoneNumber;
+      query.receiverPhoneNumber = receiverPhoneNumber;
     } else {
       console.log('No valid search parameter provided');
-      return res.status(400).json({ error: 'Please provide patientNumber, icPassNum, or receiverPhoneNumber' });
+      return res.status(400).json({ error: 'Please provide search parameters' });
     }
 
-    console.log(`Searching by ${field} = "${value}"`);
+    // Add date filter for performance
+    const combinedFilter = {
+      ...query,
+      ...getDateFilter()
+    };
 
-    // Create the query object
-    const query = {};
-    
-    // For IC/Passport number, search both icPassNum and passport fields
-    if (field === 'icPassNum') {
-      query.$or = [
-        { icPassNum: value },
-        { passport: value }
-      ];
-    } else {
-      query[field] = value;
-    }
+    console.log('Final MongoDB query:', JSON.stringify(combinedFilter, null, 2));
 
-    console.log('MongoDB query:', JSON.stringify(query, null, 2));
-    console.log('Collection name:', Order.collection.name);
+    // Use explain() to check index usage (for debugging)
+    // const explainResult = await Order.find(combinedFilter).explain("executionStats");
+    // console.log('Query plan:', explainResult.executionStats);
 
-    // First, let's check if there are any orders at all
-    const totalOrders = await Order.countDocuments({});
-    console.log(`Total orders in collection: ${totalOrders}`);
-
-    // Search without date restrictions
-    const orders = await Order.find(query)
+    const orders = await Order.find(combinedFilter)
       .sort({ creationDate: -1 })
-      .limit(500)
-      .lean(); // Use lean() for better performance
+      .limit(100) // Reduced limit for better performance
+      .lean();
 
     console.log(`Found ${orders.length} matching orders`);
-    
-    if (orders.length > 0) {
-      console.log('First matching order:', {
-        _id: orders[0]._id,
-        patientNumber: orders[0].patientNumber,
-        icPassNum: orders[0].icPassNum,
-        passport: orders[0].passport,
-        receiverPhoneNumber: orders[0].receiverPhoneNumber,
-        receiverName: orders[0].receiverName
-      });
-    }
-
-    // If no results, let's check for similar values (case-insensitive search)
-    if (orders.length === 0) {
-      console.log('No exact matches found, trying case-insensitive search...');
-      
-      let caseInsensitiveQuery = {};
-      if (field === 'icPassNum') {
-        caseInsensitiveQuery.$or = [
-          { icPassNum: { $regex: new RegExp(`^${value}$`, 'i') } },
-          { passport: { $regex: new RegExp(`^${value}$`, 'i') } }
-        ];
-      } else {
-        caseInsensitiveQuery[field] = { $regex: new RegExp(`^${value}$`, 'i') };
-      }
-      
-      const caseInsensitiveResults = await Order.find(caseInsensitiveQuery)
-        .sort({ creationDate: -1 })
-        .limit(500)
-        .lean();
-        
-      console.log(`Case-insensitive search found ${caseInsensitiveResults.length} orders`);
-      
-      if (caseInsensitiveResults.length > 0) {
-        console.log('Note: Found results with case-insensitive search. Consider updating your search to be case-insensitive by default.');
-      }
-    }
-
     console.log('=== END SEARCH REQUEST ===\n');
+    
     res.json(orders);
   } catch (error) {
     console.error('Search error:', error);
@@ -807,7 +888,9 @@ app.get('/api/orders', async (req, res) => {
     const queryOptions = getQueryOptions(req.userRole);
 
     const orders = await Order.find(combinedFilter)
-      .sort(queryOptions.sort || {});
+      .sort(queryOptions.sort || {})
+      .hint({ product: 1, creationDate: -1 }) // Force index usage
+      .maxTimeMS(5000); // Timeout after 5 seconds
       
     // Get saved orders from DMS
     const savedOrders = await DMSForm.distinct('orderIds');
@@ -1639,6 +1722,22 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
   });
+});
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/')) {
+    const start = Date.now();
+    
+    res.on('finish', () => {
+      const duration = Date.now() - start;
+      console.log(`⏱️  ${req.method} ${req.path} - ${duration}ms`);
+      
+      if (duration > 1000) {
+        console.warn(`🚨 Slow API call: ${req.path} took ${duration}ms`);
+      }
+    });
+  }
+  next();
 });
 
 // Endpoint to manually trigger sync
