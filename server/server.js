@@ -22,7 +22,8 @@ const corsOptions = {
   origin: [
     'http://localhost:5173',
     'https://grpharmacyappfrontend.vercel.app',
-    'https://pharmacy.gorushbn.com'
+    'https://pharmacy.gorushbn.com',
+    'https://gorushpharmacy-frontend.vercel.app/'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Role'],
