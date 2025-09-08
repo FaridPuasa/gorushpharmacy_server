@@ -42,8 +42,8 @@ const uri = process.env.MONGO_URI;
 mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(async () => {
     console.log("✅ MongoDB connected");
-    // Run initial collection date sync
-    await initializeCollectionDateSync();
+    // Run initial sync including cancellations
+    await initializeDeTrackSync();
     // Create indexes
     await createIndexes();
   })
@@ -1400,6 +1400,23 @@ cron.schedule('*/10 * * * *', async () => {
   }
 });
 
+//cancellation sync
+cron.schedule('0 1 * * *', async () => {  // Run at 1 AM daily
+  console.log(`⏰ [CANCELLATION CRON] Running daily DeTrack cancellation sync at ${new Date().toISOString()}`);
+  try {
+    const result = await syncDeTrackCancellations();
+    console.log(`✅ [CANCELLATION CRON] Daily cancellation sync completed. Cancelled ${result.cancelledCount || 0} orders.`);
+    
+    if (result.cancelledCount > 0) {
+      console.log(`📊 [CANCELLATION CRON] Sync summary: ${result.cancelledCount} orders marked as cancelled`);
+    } else {
+      console.log(`ℹ️ [CANCELLATION CRON] No orders needed cancellation updates`);
+    }
+  } catch (error) {
+    console.error('❌ [CANCELLATION CRON] Error in scheduled cancellation sync:', error);
+  }
+});
+
 cron.schedule('0 2 * * *', async () => {
       console.log(`🏠 [COLLECTION DATE CRON] Running daily MH/JP collection date sync at ${new Date().toISOString()}`);
   try {
@@ -1425,6 +1442,21 @@ async function initializeCollectionDateSync() {
     console.error('❌ [STARTUP] Error in initial MH/JP collection date sync:', error);
   }
 }
+
+async function initializeDeTrackSync() {
+  console.log(`🔄 [STARTUP] Running initial DeTrack sync on server start`);
+  try {
+    // Run both collection date sync and cancellation sync on startup
+    const collectionResult = await updateCollectionDatesFromDeTrack();
+    console.log(`✅ [STARTUP] Initial collection date sync completed. Updated ${collectionResult.updatedCount || 0} collection dates.`);
+    
+    const cancellationResult = await syncDeTrackCancellations();
+    console.log(`✅ [STARTUP] Initial cancellation sync completed. Cancelled ${cancellationResult.cancelledCount || 0} orders.`);
+  } catch (error) {
+    console.error('❌ [STARTUP] Error in initial DeTrack sync:', error);
+  }
+}
+
 
 async function syncDeTrackStatuses() {
   try {
@@ -1558,6 +1590,173 @@ async function syncDeTrackStatuses() {
     
   } catch (error) {
     console.error('❌ Error in DeTrack sync:', error);
+    return { 
+      success: false, 
+      error: error.message,
+      stack: error.stack 
+    };
+  }
+}
+
+async function syncDeTrackCancellations() {
+  try {
+    // Get all orders with tracking numbers that are not already cancelled
+    const orders = await Order.find({
+      doTrackingNumber: { $exists: true, $ne: null },
+      goRushStatus: { $ne: 'cancelled' },
+      // Only check recent orders to avoid unnecessary API calls
+      creationDate: { $gte: '2025-07-01' }
+    }).limit(500); // Process in batches
+    
+    console.log(`🔄 Starting DeTrack cancellation sync for ${orders.length} orders`);
+    
+    let cancelledCount = 0;
+    let apiCalls = 0;
+    let errors = 0;
+    
+    for (const order of orders) {
+      try {
+        console.log(`🔍 Checking cancellation status for ${order.doTrackingNumber}`);
+        
+        apiCalls++;
+        const response = await fetch(`https://app.detrack.com/api/v2/dn/jobs/show/?do_number=${order.doTrackingNumber}`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-KEY': process.env.DETRACK_API_KEY || 'Ude778d93ebd628e6c942a4c4f359643e9cefc1949b17d433'
+          }
+        });
+        
+        if (!response.ok) {
+          console.error(`❌ API error for ${order.doTrackingNumber}: ${response.status}`);
+          errors++;
+          continue;
+        }
+        
+        const responseData = await response.json();
+        // Handle both nested and non-nested response structures
+        const data = responseData.data || responseData;
+        
+        console.log(`📦 DeTrack response for ${order.doTrackingNumber}:`, {
+          status: data?.status,
+          tracking_status: data?.tracking_status,
+          primary_job_status: data?.primary_job_status
+        });
+        
+        // FIXED: More comprehensive cancellation detection
+        // Check for exact matches first (case-sensitive)
+        const isCancelledExact = 
+          data?.tracking_status === 'Cancelled' ||
+          data?.primary_job_status === 'cancelled' ||
+          data?.status === 'cancelled' ||
+          data?.status === 'Cancelled';
+        
+        // Then check for case-insensitive matches in all status fields
+        const statusIndicators = [
+          data?.status,
+          data?.tracking_status, 
+          data?.primary_job_status,
+          data?.job_status, // Additional field that might contain cancellation status
+          data?.delivery_status // Another potential field
+        ].filter(Boolean);
+
+        const isCancelledCaseInsensitive = statusIndicators.some(status => {
+          const normalizedStatus = String(status).toLowerCase();
+          return (
+            normalizedStatus === 'cancelled' ||
+            normalizedStatus === 'canceled' ||
+            normalizedStatus.includes('cancel') ||
+            normalizedStatus === 'aborted' ||
+            normalizedStatus === 'void' ||
+            normalizedStatus === 'terminated'
+          );
+        });
+
+        const isCancelled = isCancelledExact || isCancelledCaseInsensitive;
+
+        console.log(`🔍 Cancellation check for ${order.doTrackingNumber}:`, {
+          isCancelledExact,
+          isCancelledCaseInsensitive,
+          isCancelled,
+          statusIndicators,
+          trackingStatus: data?.tracking_status,
+          primaryJobStatus: data?.primary_job_status
+        });
+        
+        if (isCancelled) {
+          console.log(`❌ Found cancelled status for ${order.doTrackingNumber}`);
+          
+          // Update order status to cancelled
+          const updateData = {
+            goRushStatus: 'cancelled',
+            currentStatus: 'Cancelled',
+            pharmacyFormCreated: 'Yes', // Mark as form created when cancelled
+            updatedAt: new Date()
+          };
+          
+          // Add detrack cancellation data for reference
+          if (data) {
+            updateData.detrackCancellationData = {
+              status: data.status,
+              trackingStatus: data.tracking_status,
+              primaryJobStatus: data.primary_job_status,
+              jobStatus: data.job_status,
+              deliveryStatus: data.delivery_status,
+              cancelledAt: new Date(),
+              lastUpdated: new Date(),
+              rawResponse: data // Store full response for debugging
+            };
+          }
+          
+          const updatedOrder = await Order.findByIdAndUpdate(
+            order._id,
+            updateData,
+            { new: true, runValidators: false }
+          );
+          
+          // Add a log entry for this cancellation
+          const logEntry = {
+            note: `Order automatically cancelled based on DeTrack status - tracking_status: "${data?.tracking_status}", primary_job_status: "${data?.primary_job_status}", status: "${data?.status}"`,
+            category: 'Status Update',
+            createdBy: 'system',
+            createdAt: new Date(),
+          };
+
+          updatedOrder.logs.push(logEntry);
+          await updatedOrder.save();
+          
+          // Clear orders cache since we updated an order
+          clearCachePattern('orders_');
+          
+          cancelledCount++;
+          console.log(`❌ Updated order ${order._id} to cancelled (tracking: ${order.doTrackingNumber})`);
+        } else {
+          console.log(`✅ Order ${order.doTrackingNumber} not cancelled - Status indicators: ${statusIndicators.join(', ')}`);
+        }
+        
+        // Add delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 300));
+        
+      } catch (error) {
+        errors++;
+        console.error(`❌ Error checking cancellation for order ${order._id} (${order.doTrackingNumber}):`, error.message);
+      }
+    }
+    
+    console.log(`📊 Cancellation sync summary:
+    - API calls made: ${apiCalls}
+    - Orders cancelled: ${cancelledCount}
+    - Errors: ${errors}`);
+    
+    return { 
+      success: true, 
+      cancelledCount,
+      apiCalls,
+      errors
+    };
+    
+  } catch (error) {
+    console.error('❌ Error in DeTrack cancellation sync:', error);
     return { 
       success: false, 
       error: error.message,
