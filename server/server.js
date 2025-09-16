@@ -15,7 +15,7 @@ dotenv.config();
 const app = express();
 
 // Initialize cache with 60-second TTL
-const cache = new NodeCache({ stdTTL: 7200, checkperiod: 600 });
+const cache = new NodeCache({ stdTTL: 900, checkperiod: 300 });
 
 // Enhanced CORS configuration
 const corsOptions = {
@@ -1385,11 +1385,12 @@ app.post('/api/detrack/bulk-update', async (req, res) => {
   }
 });
 
-cron.schedule('*/10 * * * *', async () => {
-  console.log(`⏰ [CRON] Running scheduled DeTrack sync at ${new Date().toISOString()}`);
+// DeTrack status sync - run once daily at 2:00 AM
+cron.schedule('0 2 * * *', async () => {
+  console.log(`⏰ [CRON] Running daily DeTrack sync at ${new Date().toISOString()}`);
   try {
     const result = await syncDeTrackStatuses();
-    console.log(`✅ [CRON] Scheduled sync completed. Updated ${result.updatedCount || 0} orders.`);
+    console.log(`✅ [CRON] Daily sync completed. Updated ${result.updatedCount || 0} orders.`);
     
     if (result.updatedCount > 0) {
       console.log(`📊 [CRON] Sync summary: ${result.updatedCount} orders updated to 'collected'`);
@@ -1397,12 +1398,12 @@ cron.schedule('*/10 * * * *', async () => {
       console.log(`ℹ️ [CRON] No orders needed status updates`);
     }
   } catch (error) {
-    console.error('❌ [CRON] Error in scheduled sync:', error);
+    console.error('❌ [CRON] Error in daily sync:', error);
   }
 });
 
-//cancellation sync
-cron.schedule('0 1 * * *', async () => {  // Run at 1 AM daily
+// Cancellation sync - run once daily at 1:00 AM
+cron.schedule('0 1 * * *', async () => {
   console.log(`⏰ [CANCELLATION CRON] Running daily DeTrack cancellation sync at ${new Date().toISOString()}`);
   try {
     const result = await syncDeTrackCancellations();
@@ -1414,12 +1415,13 @@ cron.schedule('0 1 * * *', async () => {  // Run at 1 AM daily
       console.log(`ℹ️ [CANCELLATION CRON] No orders needed cancellation updates`);
     }
   } catch (error) {
-    console.error('❌ [CANCELLATION CRON] Error in scheduled cancellation sync:', error);
+    console.error('❌ [CANCELLATION CRON] Error in daily cancellation sync:', error);
   }
 });
 
-cron.schedule('0 2 * * *', async () => {
-      console.log(`🏠 [COLLECTION DATE CRON] Running daily MH/JP collection date sync at ${new Date().toISOString()}`);
+// Collection date sync - run once daily at 3:00 AM
+cron.schedule('0 3 * * *', async () => {
+  console.log(`🏠 [COLLECTION DATE CRON] Running daily MH/JP collection date sync at ${new Date().toISOString()}`);
   try {
     const result = await updateCollectionDatesFromDeTrack();
     console.log(`✅ [COLLECTION DATE CRON] Daily sync completed. Updated ${result.updatedCount || 0} collection dates.`);
@@ -1430,7 +1432,7 @@ cron.schedule('0 2 * * *', async () => {
       console.log(`ℹ️ [COLLECTION DATE CRON] No MH/JP orders needed collection date updates`);
     }
   } catch (error) {
-    console.error('❌ [COLLECTION DATE CRON] Error in scheduled collection date sync:', error);
+    console.error('❌ [COLLECTION DATE CRON] Error in daily collection date sync:', error);
   }
 });
 
